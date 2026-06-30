@@ -1,0 +1,71 @@
+---
+title: /write-mint — author a page
+sidebarTitle: write-mint
+description: The Claude Code skill that captures a process or topic as a page in this docs site — interviewing for content, placing it in the nav, and shipping it.
+---
+
+**`/write-mint`** is the Claude Code skill that writes *into* this knowledge
+base. Point it at a process, a service, or a convention and it does the whole
+job — not just the prose: it interviews you, decides where the page belongs,
+writes it in house style, wires the navigation, validates the build, and ships
+it. It's how these pages get written, including the one you're reading.
+
+To query the docs instead of adding to them, use [`/read-mint`](/skills/read-mint).
+
+## Using it
+
+```
+/write-mint our deploy runbook
+/write-mint how lead routing works
+/write-mint        # then it asks what to document
+```
+
+- Give it a topic, or let it pull from the current repo/conversation
+  ("document what we just did").
+- With no topic and no context, it asks once — it won't freelance.
+
+## What it does
+
+<Steps>
+  <Step title="Interview">
+    Asks only what it can't infer: what the thing is and who it's for, why it
+    exists, the actual steps or shape, and the gotchas. When documenting code it
+    **reads the source** rather than asking you to recite it — names, flags and
+    paths are verified, never invented.
+  </Step>
+  <Step title="Place it">
+    Picks the smallest correct home — extend an existing page, add a sibling page
+    to an existing group, or (only for a genuinely new area, with your sign-off)
+    a new nav group. Confirms the group + slug with you.
+  </Step>
+  <Step title="Write it">
+    Produces house-style MDX: `title` + `sidebarTitle` + `description`
+    frontmatter, Mintlify components (`Card`, `Note`, `Warning`, `Steps`),
+    filename-labelled code blocks, the multi-tenant Flow voice, and cross-links.
+    Secrets are always redacted to their names.
+  </Step>
+  <Step title="Validate">
+    Parses `docs.json` and runs `mint broken-links`; both must pass before it
+    ships. A local `mint dev` preview is offered on request.
+  </Step>
+  <Step title="Ship">
+    Shows a one-line summary, then — after a single confirmation, because the
+    site auto-deploys from `main` — commits and pushes to `main`.
+  </Step>
+</Steps>
+
+## House rules it follows
+
+| Rule | Why |
+| --- | --- |
+| `sidebarTitle` on every long title | Keeps the sidebar single-line |
+| Secret **names** only, values redacted | Never leak keys into a public-ish doc |
+| Match an existing page's structure | Consistent voice across the site |
+| One page = one thing | Two topics → two pages |
+| Confirm placement, confirm the push | Placement is a nav change; the push deploys |
+
+<Note>
+  `/write-mint` is the canonical way to add to these docs. If you're writing a
+  page by hand instead, mirror the [Workers](/workers/overview) pages and the
+  rules above — especially `sidebarTitle` and secret redaction.
+</Note>

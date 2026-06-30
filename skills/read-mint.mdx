@@ -1,0 +1,60 @@
+---
+title: /read-mint — answer from the docs
+sidebarTitle: read-mint
+description: The Claude Code skill that answers a question using only this knowledge base, citing the page and its live URL.
+---
+
+**`/read-mint`** is the Claude Code skill that reads *out* of this knowledge
+base. Ask it a question and it searches the docs, reads the relevant pages, and
+answers **only from what's written here** — quoting exact values and citing the
+page. It's the read side of the pair; to add a page, use
+[`/write-mint`](/skills/write-mint).
+
+The contract: the docs are the authority, not the model. If the knowledge base
+doesn't cover something, `/read-mint` says so plainly and offers to capture it
+with `/write-mint` — it won't fill the gap from memory or the surrounding
+codebase.
+
+## Using it
+
+```
+/read-mint how does lead-listener auth work?
+/read-mint what's our PostHog tenant convention?
+/read-mint which workers are there?
+```
+
+You can also just ask "what do our docs say about X".
+
+## How it answers
+
+<Steps>
+  <Step title="Refresh">
+    Pulls the latest `main` so it reads the published state (or falls back to the
+    live page / raw MDX if the repo isn't local).
+  </Step>
+  <Step title="Find the relevant pages">
+    Skims `docs.json` for the likely group, greps the `.mdx` for the question's
+    terms, and opens whole pages — caveats often live in a `Note`/`Warning`.
+  </Step>
+  <Step title="Answer from the text">
+    Replies concisely, faithful to the page, quoting exact values (hosts,
+    endpoints, env-var names) verbatim. If two pages disagree, it surfaces that.
+  </Step>
+  <Step title="Cite">
+    Ends with the source — page title + live URL
+    (`https://docs.inference.so/<page-id>`), and the section when relevant.
+  </Step>
+</Steps>
+
+## When the docs don't cover it
+
+It doesn't guess. It tells you the knowledge base doesn't document it, points to
+the closest page if there is one, and offers:
+
+> Not in the docs yet. Want me to capture it with `/write-mint <topic>`?
+
+<Note>
+  Because `/read-mint` only answers from what's written, the quality of an answer
+  is the quality of the page. If it can't find something it should know, that's a
+  cue to [`/write-mint`](/skills/write-mint) it.
+</Note>
