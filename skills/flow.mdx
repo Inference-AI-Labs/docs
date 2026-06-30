@@ -1,0 +1,87 @@
+---
+title: /flow — draw a client workflow
+sidebarTitle: flow
+description: The Claude Code skill that draws a workflow as a diagram and publishes it for a client at workflow.takeflow.io, grouped by tenant with an auto tab bar.
+---
+
+**`/flow`** turns a description of a workflow into a live diagram a **client** can
+open and understand — published at `https://workflow.takeflow.io/flow/<id>` in the
+takeflow-branded [/arch](/workers/takeflow) design (logo header, layered layout,
+animated flow edges, dark/light, mobile-friendly).
+
+It's how we show a client what their automation does. The page is served by the
+[takeflow worker](/workers/takeflow) from KV — publishing is just a write, no
+deploy.
+
+## Using it
+
+```
+/flow our events booking automation from enquiry to deposit
+/flow        # then it asks what to draw
+```
+
+## What it does
+
+<Steps>
+  <Step title="Resolve the tenant">
+    Every flow belongs to a client (tenant). The skill checks what already exists
+    so it reuses the right tenant and never splits one client across two names —
+    then either **creates** a new tenant or **adds** the workflow to an existing
+    one.
+  </Step>
+  <Step title="Design the workflow">
+    Left→right stages become layers; each step is a node, connections are edges
+    (solid = data/value flow, dashed = control).
+  </Step>
+  <Step title="Write + publish">
+    Saves the flow definition with its `tenant` + `status`, then publishes to KV.
+    The tenant's tab bar updates **automatically** — a new workflow shows up
+    across all of that client's pages.
+  </Step>
+</Steps>
+
+## Tenants & the tab bar
+
+A tenant's workflows share a switcher (tab bar) driven by a single per-tenant
+index — the same model the [takeflow worker](/workers/takeflow) renders.
+
+- **New client** → publishing the first flow with a new `tenant` **creates** the
+  index. No separate setup step.
+- **Existing client** → reuse the tenant name; the new flow joins the tab bar
+  automatically, and nothing else needs editing.
+- **Status** — `active` (green, counts toward the `$/mo` billing line) or
+  `planned` (amber, upcoming).
+- If the tenant name is ambiguous (close to an existing one), the skill **asks**
+  before creating a new one — it won't silently fork a client.
+
+## Client-facing language (the hard rule)
+
+These diagrams are shown **to clients**, so they describe outcomes in the client's
+words — **never** our backend or tooling.
+
+<Warning>
+  Never name internal systems or vendors in a flow. No `Supabase`, `Postgres`,
+  `API`, `webhook`, `Vercel`, `Cloudflare`, `Worker`, `KV`, `Kapso`, `Resend`,
+  `Telegram`, `cron`, `endpoint`, etc.
+</Warning>
+
+| Don't write | Write instead |
+| --- | --- |
+| Supabase / Postgres / database | "Customer records", "Your data", "CRM" |
+| API / endpoint / webhook | "Website form", "Incoming enquiry", "Integration" |
+| Vercel / Cloudflare / Worker / KV | _(omit — just name the capability)_ |
+| Kapso / Twilio | "WhatsApp", "SMS" |
+| Resend / SMTP | "Email" |
+| LLM / model / GPT / prompt | "AI assistant", "AI" |
+| cron / scheduler | "Daily", "On a schedule" |
+
+Name the channel or outcome the client recognises ("WhatsApp reply", "Quote
+sent", "Deposit paid"), never the vendor. The page renders the **takeflow logo**
+and brand styling automatically — the skill doesn't add branding, it matches the
+calm, plain-English tone.
+
+<Note>
+  `/flow` is the canonical way to publish these. The diagrams render from the
+  takeflow worker — see [takeflow](/workers/takeflow) for how a flow is stored
+  and served, and how the tenant switcher index works.
+</Note>

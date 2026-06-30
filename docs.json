@@ -38,6 +38,7 @@
       {
         "group": "Skills",
         "pages": [
+          "skills/flow",
           "skills/write-mint",
           "skills/read-mint"
         ]
