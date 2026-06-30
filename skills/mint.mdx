@@ -1,31 +1,28 @@
 ---
-title: /mint — write to the knowledge base
+title: mint — the knowledge base skills
 sidebarTitle: mint
-description: A Claude Code skill that captures a process or topic as a page in this docs site — interviewing for content, placing it in the nav, and shipping it.
+description: Two Claude Code skills that maintain and query this docs site — /write-mint to author a page, /read-mint to answer from it.
 ---
 
-**`/mint`** is the Claude Code skill that maintains *this* knowledge base. Point
-it at a process, a service, or a convention and it captures the page for you:
-it asks the right questions, decides where the page belongs, writes it in house
-style, wires the navigation, validates the build, and ships it.
+These docs are maintained by a pair of Claude Code skills. One **writes** to the
+knowledge base, the other **reads** from it. Together they're how Flow's
+engineering knowledge gets in — and back out.
 
-It's how these docs get written — including the page you're reading.
+<CardGroup cols={2}>
+  <Card title="/write-mint" icon="pen-to-square">
+    Capture a process or topic as a new/updated page — interview, place, write,
+    validate, ship.
+  </Card>
+  <Card title="/read-mint" icon="magnifying-glass">
+    Answer a question using only what's written here, with citations to the page
+    and its live URL.
+  </Card>
+</CardGroup>
 
-## Using it
+## /write-mint — author a page
 
-In Claude Code:
-
-```
-/mint our deploy runbook
-/mint how lead routing works
-/mint        # then it asks what to document
-```
-
-- Give it a topic, or let it pull from the current repo/conversation
-  ("document what we just did").
-- With no topic and no context, it asks once — it won't freelance.
-
-## What it does
+`/write-mint <topic>` (or bare, then it asks). It does the whole job, not just
+the prose:
 
 <Steps>
   <Step title="Interview">
@@ -37,17 +34,17 @@ In Claude Code:
   <Step title="Place it">
     Picks the smallest correct home — extend an existing page, add a sibling page
     to an existing group, or (only for a genuinely new area, with your sign-off)
-    a new nav group. Confirms the group + slug with you.
+    a new nav group. Confirms the group + slug.
   </Step>
   <Step title="Write it">
-    Produces house-style MDX: `title` + `sidebarTitle` + `description`
-    frontmatter, Mintlify components (`Card`, `Note`, `Warning`, `Steps`),
-    filename-labelled code blocks, the multi-tenant Flow voice, and cross-links.
-    Secrets are always redacted to their names.
+    House-style MDX: `title` + `sidebarTitle` + `description` frontmatter,
+    Mintlify components (`Card`, `Note`, `Warning`, `Steps`), filename-labelled
+    code blocks, the multi-tenant Flow voice, cross-links. Secrets are always
+    redacted to their names.
   </Step>
   <Step title="Validate">
     Parses `docs.json` and runs `mint broken-links`; both must pass before it
-    ships. A local `mint dev` preview is offered on request.
+    ships.
   </Step>
   <Step title="Ship">
     Shows a one-line summary, then — after a single confirmation, because the
@@ -55,18 +52,27 @@ In Claude Code:
   </Step>
 </Steps>
 
-## House rules it follows
+## /read-mint — answer from the docs
+
+`/read-mint <question>` (e.g. *how does lead-listener auth work?*). It searches
+the pages, reads the relevant ones, and answers **only from what's written
+here** — quoting exact values and citing the page + live URL. If the docs don't
+cover it, it says so plainly and offers to capture it with `/write-mint`. It
+won't fill the gap from memory or the codebase.
+
+## House rules they follow
 
 | Rule | Why |
 | --- | --- |
 | `sidebarTitle` on every long title | Keeps the sidebar single-line |
-| Secret **names** only, values redacted | Never leak keys into a public-ish doc |
+| Secret **names** only, values redacted | Never leak keys into the docs |
 | Match an existing page's structure | Consistent voice across the site |
 | One page = one thing | Two topics → two pages |
-| Confirm placement, confirm the push | Placement is a nav change; the push deploys |
+| `/write-mint` confirms placement + the push | Placement is a nav change; the push deploys |
+| `/read-mint` cites every claim, never invents | The docs are the authority, not the model |
 
 <Note>
-  `/mint` is the canonical way to add to these docs. If you're writing a page by
-  hand instead, mirror the [Workers](/workers/overview) pages and the rules
-  above — especially `sidebarTitle` and secret redaction.
+  `/write-mint` is the canonical way to add to these docs. If you're writing a
+  page by hand instead, mirror the [Workers](/workers/overview) pages and the
+  rules above — especially `sidebarTitle` and secret redaction.
 </Note>
