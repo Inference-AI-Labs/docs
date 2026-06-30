@@ -34,6 +34,12 @@
           "workers/flow-comments",
           "workers/cpaas-listener"
         ]
+      },
+      {
+        "group": "Skills",
+        "pages": [
+          "skills/mint"
+        ]
       }
     ],
     "global": {
