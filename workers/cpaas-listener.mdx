@@ -1,0 +1,98 @@
+---
+title: cpaas-listener — cpaas.takeflow.io
+description: Receive-only CPaaS endpoint — normalizes inbound call and recording webhooks from each tenant's telephony provider.
+---
+
+**`cpaas-listener`** (`cpaas.takeflow.io`) is **CPaaS for clients** — a
+receive-only endpoint for telephony webhooks. Each tenant points their provider
+(Twilio, Plivo, Exotel, Telnyx, Vonage, or a generic source) at their own
+unguessable URL, and the worker parses and normalizes every call / recording
+event into one shape.
+
+| | |
+| --- | --- |
+| Host | `cpaas.takeflow.io` |
+| Entry | `src/worker.ts` (Hono) |
+| Tenant key | unguessable path token — `/webhook/<token>` |
+| Config | `clients.json` |
+| Storage | **none yet** — events are structured-logged (see [Persistence](#persistence)) |
+
+## The endpoint
+
+```http
+POST https://cpaas.takeflow.io/webhook/<token>
+```
+
+The path token identifies the tenant; the tenant's configured `provider`
+decides how the body is parsed. The worker reads the raw body once (so the same
+bytes can also feed signature verification), normalizes it, persists it, and
+acks with `204` — providers only need a 2xx.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| `POST` | `/webhook/:token` | `204` (or `404` unknown tenant, `403` bad signature) |
+| `GET` | `/health` | `{ ok, clients }` |
+
+## Providers & normalization
+
+Whatever the provider sends, it's mapped to a single `CallEvent`. Unknown fields
+always survive under `raw`, so nothing is lost.
+
+```ts CallEvent (src/providers.ts)
+{
+  provider, kind,        // kind: "call" | "recording" | "unknown"
+  call_id, from, to, direction, status,
+  duration_sec, recording_url, recording_duration_sec, timestamp,
+  raw,                   // full original payload
+}
+```
+
+| Provider | Format | Notes |
+| --- | --- | --- |
+| `twilio` | form-encoded | status + recording callbacks |
+| `plivo` | form / JSON | call status + record callbacks |
+| `exotel` | form-encoded | passthru / status |
+| `telnyx` | JSON (`data.payload`) | Call Control webhooks |
+| `vonage` | JSON | voice + recording events |
+| `generic` | anything | best-effort field extraction, keeps `raw` |
+
+## Auth & signature verification
+
+The **path token is the baseline auth** — same trust model as lead-listener's
+`apikey`. Signature verification is **opt-in per tenant** (`verify_signature: true`
++ a `signing_secret_env` secret):
+
+- **Twilio** — HMAC-SHA1 over URL + sorted params vs `X-Twilio-Signature`.
+- **Plivo** — HMAC-SHA256 over URL + nonce vs `X-Plivo-Signature-V3`.
+
+<Warning>
+  Turning on `verify_signature` for a provider that isn't Twilio or Plivo throws
+  a `501` — an accidental opt-in fails loudly instead of silently trusting the
+  request. Implement the provider's scheme in `verify.ts` first.
+</Warning>
+
+## Tenant config
+
+```json clients.json
+{
+  "name": "dmn",
+  "token": "cpaas_live_a247…0c7e6bbb443",
+  "provider": "generic",
+  "verify_signature": false,
+  "active": true
+}
+```
+
+Onboarding: add an entry with an unguessable `token`, the tenant's `provider`,
+and (optionally) `verify_signature` + `signing_secret_env`; give the tenant
+`https://cpaas.takeflow.io/webhook/<token>`; deploy.
+
+## Persistence
+
+There's **no datastore yet**. `persistCall()` in `src/persist.ts` is the single
+seam: today it emits one structured `console.log` line (`tag: "cpaas.call"`)
+captured by Workers observability — durable enough to inspect and replay.
+
+When storage is added, the write goes **here and nowhere else** — add the binding
+to `Env` + `wrangler.jsonc`, then INSERT into central D1 or POST to the tenant's
+Supabase `calls` table keyed by `call_id` for idempotency. Nothing else changes.

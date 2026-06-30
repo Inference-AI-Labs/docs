@@ -1,0 +1,90 @@
+---
+title: Workers overview
+description: The five Cloudflare Workers behind *.takeflow.io — one monorepo, one account, all tenant-based.
+---
+
+Flow's backend edge runs on a small set of **Cloudflare Workers**, all in one
+account (`07f6a2e9…ae62f`) and one monorepo at `~/Documents/inference/workers`.
+Each worker owns a subdomain of `takeflow.io` and, like the rest of Flow, is
+**multi-tenant** — a single deployment serves every client, kept apart by a
+tenant identifier carried in the request (an API key, a path token, or a URL
+segment).
+
+## The map
+
+| Subdomain | Worker | Does |
+| --- | --- | --- |
+| `workflow.takeflow.io` | [**takeflow**](/workers/takeflow) | Renders published workflow diagrams we share with clients |
+| `api.takeflow.io` | [**lead-listener**](/workers/lead-listener) | All inbound APIs & webhooks — today, lead capture into each tenant's DB |
+| `mcp.takeflow.io` | [**flow-mcp**](/workers/flow-mcp) | Per-tenant MCP server — tasks, customers, partners, team, prospects |
+| `cx.takeflow.io` | [**flow-comments**](/workers/flow-comments) | Collects client feedback + attachments |
+| `cpaas.takeflow.io` | [**cpaas-listener**](/workers/cpaas-listener) | Receive-only CPaaS (call/recording) webhooks for clients |
+
+<CardGroup cols={2}>
+  <Card title="takeflow" icon="diagram-project" href="/workers/takeflow">
+    Workflow diagrams at `/flow/<id>`, served from KV.
+  </Card>
+  <Card title="lead-listener" icon="inbox-in" href="/workers/lead-listener">
+    `/create-lead` & `/webhook` → tenant Supabase, D1 backup, queued notify.
+  </Card>
+  <Card title="flow-mcp" icon="plug" href="/workers/flow-mcp">
+    MCP over a secret `{repo}/{uuid}` URL, config-driven tools per tenant.
+  </Card>
+  <Card title="flow-comments" icon="comment-dots" href="/workers/flow-comments">
+    Workspace-scoped feedback into the Things Supabase + private bucket.
+  </Card>
+  <Card title="cpaas-listener" icon="phone-arrow-down-left" href="/workers/cpaas-listener">
+    Path-token tenants, per-provider call webhook normalization.
+  </Card>
+</CardGroup>
+
+## How tenancy works
+
+There is no per-client deployment of these workers — **one worker, many
+tenants**. Each worker resolves the tenant from the request and looks up its
+config (and secrets) from a bundled file:
+
+| Worker | Tenant key | Config file |
+| --- | --- | --- |
+| lead-listener | `apikey` header (Supabase publishable key) | `clients.json` |
+| cpaas-listener | unguessable path token (`/webhook/<token>`) | `clients.json` |
+| flow-mcp | `{repo}` URL segment | `projects.json` |
+| flow-comments | `X-Workspace-Url` header | _(single Supabase, scoped by column)_ |
+| takeflow | flow `id` in the path | _(KV-keyed)_ |
+
+<Note>
+  Config files (`clients.json`, `projects.json`) are committed and reference
+  **secret names**, never secret values. The actual per-tenant keys are set with
+  `wrangler secret put` and read from the worker's `env` at runtime by the name
+  the config gives (e.g. `service_key_env: "CLIENT_CARMATE_SERVICE_KEY"`).
+</Note>
+
+## Shared conventions
+
+- **Stack** — every worker is [Hono](https://hono.dev) on Workers except
+  `takeflow` (plain `fetch` handler). Source is TypeScript; deploy is
+  `wrangler deploy` from each worker's directory.
+- **Analytics** — server-side events go to the one shared
+  [PostHog](/conventions/posthog) project, tagged with the tenant. Captures are
+  best-effort and wrapped in `waitUntil` so they never block or fail a response.
+- **Observability** — `observability.enabled` is on for every worker; structured
+  `console.log` lines are the durable record (notably cpaas-listener, which has
+  no datastore yet).
+- **Custom domains** — each `takeflow.io` host is provisioned via a
+  `routes: [{ pattern, custom_domain: true }]` entry; the edge cert + DNS record
+  are created on first deploy.
+
+## Deploying
+
+Each worker is an independent wrangler project. From its directory:
+
+```bash
+cd ~/Documents/inference/workers/<worker>
+wrangler deploy
+
+# secrets (per tenant, by the name its config references)
+wrangler secret put CLIENT_CARMATE_SERVICE_KEY
+```
+
+The root `takeflow` worker deploys from the monorepo root itself
+(`~/Documents/inference/workers`, `wrangler.toml`).

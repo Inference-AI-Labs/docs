@@ -1,0 +1,140 @@
+---
+title: lead-listener — api.takeflow.io
+description: All inbound APIs and webhooks. Today it captures leads into each tenant's database, backs them up, and fans out notifications.
+---
+
+**`lead-listener`** owns `api.takeflow.io` — the single front door for inbound
+APIs and webhooks. Right now it does one job: **take leads from forms and
+third-party webhooks and write them into the right tenant's database**, keep our
+own backup, then notify the client. As more inbound APIs appear they live behind
+this same host.
+
+| | |
+| --- | --- |
+| Host | `api.takeflow.io` |
+| Entry | `src/worker.ts` (Hono + Queue consumer) |
+| Tenant key | `apikey` header = the tenant's Supabase **publishable** key |
+| Config | `clients.json` |
+| Bindings | `LEADS_DB` (D1 backup), `NOTIFY_QUEUE` (`lead-notify`, DLQ `lead-notify-dlq`) |
+
+## Endpoints
+
+| Method | Path | Body | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/create-lead` | JSON | First-party form submissions (applies `CreateLeadRequest` defaults + validates `status`/`source`) |
+| `POST` | `/webhook` | JSON, form-encoded, or raw | Third-party / ad-platform webhooks (content-type tolerant) |
+| `GET` | `/health` | — | `{ ok, clients }` |
+
+Every authenticated request must carry the tenant's publishable key:
+
+```http
+POST /create-lead HTTP/1.1
+Host: api.takeflow.io
+apikey: sb_publishable_…
+Content-Type: application/json
+
+{ "name": "…", "email": "…", "phone": "…", "utm_source": "google" }
+```
+
+Auth mirrors the old FastAPI service: `401` if no `apikey`, `403` if it doesn't
+match an active client, `500` if the client's service-key secret is missing.
+
+## What happens to a lead
+
+<Steps>
+  <Step title="Resolve tenant">
+    `apikey` → `clients.json` entry. Inactive clients (`active: false`) are
+    invisible.
+  </Step>
+  <Step title="Normalize">
+    `normalizeBody` folds `utm_*` keys into a `utm` jsonb, routes unknown keys
+    into `extra_data`, and strips stray surrounding quotes. Nothing submitted is
+    ever dropped.
+  </Step>
+  <Step title="Insert into the tenant's Supabase">
+    A fresh UUID is generated and the row is `POST`ed to
+    `<supabase_url>/rest/v1/leads` with the tenant's **service key** (read from
+    `service_key_env`), stamping `created_by = system_user_id`. The client's
+    Supabase is the source of truth.
+  </Step>
+  <Step title="Back up to our D1">
+    The same lead is mirrored into our own `leads_backup` D1 table
+    (`INSERT OR REPLACE` by id → idempotent). Best-effort: a D1 hiccup never
+    fails capture.
+  </Step>
+  <Step title="Respond, then fan out">
+    `201 { id, client }` is returned immediately. Analytics and a notify job are
+    queued via `waitUntil` so they run after the response.
+  </Step>
+</Steps>
+
+## Notifications (the queue)
+
+The response doesn't wait on Telegram or WhatsApp. A job is enqueued on
+`lead-notify`; the **queue consumer** (same worker, `queue()` handler) delivers
+it with retries and a dead-letter queue.
+
+```ts src/worker.ts
+c.executionCtx.waitUntil(
+  c.env.NOTIFY_QUEUE.send({
+    publishable_key: client.publishable_key,
+    lead_id: leadId,
+    payload: normalized,
+    endpoint,
+  }),
+);
+```
+
+<Warning>
+  The queued job carries **no secrets** — only the `publishable_key`. The
+  consumer re-resolves the client and its keys from `env` on delivery. An unknown
+  client is `ack`ed (dropped); any send failure `retry`s and, after
+  `max_retries: 5`, lands in `lead-notify-dlq`.
+</Warning>
+
+Per tenant, `clients.json` can enable either channel:
+
+- **Telegram** — `sendMessage` to each id in `telegram_chat_ids` (Markdown, with
+  a plain-text retry on a 400). Token from `telegram_bot_token_env`.
+- **Kapso WhatsApp** — sends an approved template greeting to the lead's phone
+  (normalized to E.164, UAE default). Needs `kapso_api_key_env`,
+  `kapso_phone_number_id`, `kapso_template_name`.
+
+## Tenant config
+
+```json clients.json
+{
+  "name": "carmate",
+  "publishable_key": "sb_publishable_…",
+  "supabase_url": "https://huspwgnpidmunoygftyf.supabase.co",
+  "system_user_id": "d6834a47-…",
+  "service_key_env": "CLIENT_CARMATE_SERVICE_KEY",
+  "telegram_bot_token_env": "CLIENT_CARMATE_TELEGRAM_BOT_TOKEN",
+  "telegram_chat_ids": [7107675961, 8117077886, …],
+  "kapso_api_key_env": "CLIENT_CARMATE_KAPSO_API_KEY",
+  "kapso_phone_number_id": "1092279750634673",
+  "kapso_template_name": "carmate_lead_welcome_v2",
+  "active": true
+}
+```
+
+**Onboarding a tenant:** add an entry to `clients.json`, set the secrets it
+references (`wrangler secret put CLIENT_<NAME>_SERVICE_KEY`, plus any Telegram /
+Kapso secrets), and `wrangler deploy`. Analytics flow to the shared
+[PostHog](/conventions/posthog) project tagged with the tenant name.
+
+## Our backup table (D1)
+
+```sql schema.sql
+CREATE TABLE IF NOT EXISTS leads_backup (
+  id TEXT PRIMARY KEY,   -- same id written to the tenant's Supabase
+  client TEXT NOT NULL,  -- tenant name
+  endpoint TEXT NOT NULL,-- /create-lead | /webhook
+  name TEXT, email TEXT, phone TEXT, status TEXT, source TEXT, page_url TEXT,
+  payload TEXT NOT NULL, -- full normalized lead JSON
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+This is **our** copy across all tenants — independent of any client's Supabase,
+so we always retain the leads we've processed.

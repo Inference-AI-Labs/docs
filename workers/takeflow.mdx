@@ -1,0 +1,55 @@
+---
+title: takeflow — workflow diagrams
+description: workflow.takeflow.io — how we display a workflow to a client, rendered from a flow stored in KV.
+---
+
+**`takeflow`** is the root worker (`workflow.takeflow.io`). It's how we **show a
+workflow to a client**: a flow is published to KV, and the worker renders it as
+a standalone dark-themed diagram page at `/flow/<id>`. It backs the `/flow`
+skill.
+
+| | |
+| --- | --- |
+| Host | `workflow.takeflow.io` |
+| Entry | `src/index.js` (plain `fetch` handler, no framework) |
+| Storage | KV namespace `FLOWS`, keyed `flow:<id>` |
+| Renderer | `src/render.js` (+ `src/glyphs.js`) — ELK-laid-out SVG/HTML |
+
+## Routes
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| `GET` | `/flow/<id>` | Rendered diagram page (HTML) |
+| `GET` | `/api/flow/<id>` | Raw flow JSON (debug / programmatic) |
+| `GET` | `/` | Landing placeholder |
+| `GET` | `/health` | `ok` |
+
+The `id` is validated against a strict slug (`[A-Za-z0-9_-]{1,64}`) before any
+KV read, and missing flows render a branded 404 rather than an error.
+
+```js src/index.js
+const SLUG = /^[a-zA-Z0-9_-]{1,64}$/;
+
+// rendered diagram page
+const m = path.match(/^\/flow\/([^/]+)\/?$/);
+if (m) {
+  const id = decodeURIComponent(m[1]);
+  if (!SLUG.test(id)) return html(page404(id), 400);
+  const raw = await env.FLOWS.get("flow:" + id);
+  if (!raw) return html(page404(id), 404);
+  return html(renderHTML(JSON.parse(raw), id));
+}
+```
+
+## Publishing a flow
+
+A flow is a JSON document written to KV under `flow:<id>`. The `/flow` skill
+draws and publishes these; this worker is the read/render side. Rendered pages
+are cached at the edge (`Cache-Control: public, max-age=30`) and marked
+`noindex` — these are client-facing share links, not public pages.
+
+<Note>
+  `takeflow` is the only worker without per-tenant config — the flow `id` in the
+  URL is the only key, and any flow present in the `FLOWS` namespace is
+  renderable. Treat a flow `id` as a share secret.
+</Note>

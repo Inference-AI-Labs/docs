@@ -1,0 +1,78 @@
+---
+title: flow-comments — cx.takeflow.io
+description: How Flow collects feedback from clients — title, description and attachments, scoped per workspace, into the Things Supabase.
+---
+
+**`flow-comments`** (`cx.takeflow.io`) is **how we collect feedback from
+clients**. The in-app feedback widget posts a comment — with optional file
+attachments — and this worker stores it, workspace-scoped, in the Things
+Supabase and a private storage bucket.
+
+| | |
+| --- | --- |
+| Host | `cx.takeflow.io` |
+| Entry | `src/worker.ts` (Hono) |
+| Tenant key | `X-Workspace-Url` header |
+| Backend | Things Supabase — `feedback` table + `feedback-attachments` bucket (private) |
+
+## Headers
+
+Every request is scoped by headers, not a body field:
+
+| Header | Required | Meaning |
+| --- | --- | --- |
+| `X-Workspace-Url` | yes | The client workspace — every row and query is filtered by it |
+| `X-User-Email` | optional | The reporting user (stored as `person_email`; required when listing `mine=true`) |
+
+## Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/feedback` | Submit feedback (multipart) |
+| `GET` | `/feedback` | List feedback for the workspace (filters + pagination) |
+| `GET` | `/feedback/:id` | One item, scoped to the workspace |
+| `GET` | `/health` | `{ ok, service, bucket, table }` |
+
+### Submitting
+
+`POST /feedback` is `multipart/form-data`: `title` (required), `description`,
+`person`, `source`, `metadata` (JSON), and repeated `files[]`.
+
+<Steps>
+  <Step title="Upload attachments first">
+    Each file (capped at `MAX_FILE_BYTES`, default 25 MB) is uploaded to the
+    private bucket under `<feedbackId>/<random>-<safeName>`.
+  </Step>
+  <Step title="Then write the row">
+    A `feedback` row is inserted with the workspace, title, description,
+    reporter, and the attachment metadata.
+  </Step>
+  <Step title="Clean up on failure">
+    If the row insert fails, the just-uploaded objects are deleted — no orphaned
+    files.
+  </Step>
+</Steps>
+
+### Listing
+
+`GET /feedback` returns the workspace's feedback newest-first with
+`{ items, count, total, limit, offset }`. Query params: `status`, `mine=true`
+(needs `X-User-Email`), `q` (searches title + description), `limit`/`offset`,
+and `sign`.
+
+<Note>
+  The bucket is **private**. By default every attachment in a list/get response
+  is decorated with a short-lived **signed URL** (`sign=true`, 1-hour expiry).
+  Pass `sign=false` to skip signing.
+</Note>
+
+## Config & tenancy
+
+Unlike lead-listener, there's no per-client config file — flow-comments writes
+to a **single** Supabase (the Things project) and isolates tenants by the
+`workspace_url` column. Non-secret config is in `wrangler.jsonc` (`THINGS_SUPABASE_URL`,
+`FEEDBACK_BUCKET`, `FEEDBACK_TABLE`, `POSTHOG_HOST`); the `THINGS_SERVICE_KEY`
+and `POSTHOG_PROJECT_TOKEN` secrets are set with `wrangler secret put`.
+
+A `feedback_received` event (tagged with the workspace as tenant) is sent to the
+shared [PostHog](/conventions/posthog) project after each submission.

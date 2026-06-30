@@ -1,0 +1,107 @@
+---
+title: flow-mcp — mcp.takeflow.io
+description: A per-tenant MCP server over each client's Supabase — tasks, customers, partners, team and prospects, all from a config file.
+---
+
+**`flow-mcp`** (`mcp.takeflow.io`) is Flow's [MCP](https://modelcontextprotocol.io)
+server. One worker serves every tenant; which tenant — and which tools — is
+decided entirely by the URL and a config file. Connect a client (Claude Code,
+Claude Desktop, claude.ai) to:
+
+```
+https://mcp.takeflow.io/{repo}/{uuid}
+```
+
+- **`{repo}`** — the tenant (`things`, `carmate`, `themis`, `tflc`,
+  `companyfilms`), looked up in `projects.json`.
+- **`{uuid}`** — the acting user's `profiles.id` in that tenant. It scopes
+  per-user data (e.g. *my* tasks) and is the capability — the full URL is the
+  secret.
+
+| | |
+| --- | --- |
+| Host | `mcp.takeflow.io` |
+| Entry | `src/worker.ts` (Hono + MCP Streamable HTTP, stateless) |
+| Tenant key | `{repo}` path segment |
+| Config | `projects.json` |
+| Drivers | `supabase-js` (default) or `pg` via Hyperdrive (lazy-loaded) |
+
+## Request model
+
+Each POST builds a **fresh, stateless** `McpServer` keyed by `{repo}/{uuid}` and
+handles one JSON-RPC call — the Worker invocation model already gives per-request
+isolation, so there are no sessions or Durable Objects. `GET`/`DELETE` return a
+JSON-RPC `405` (no SSE resume in stateless mode). Tenant secrets arrive as
+worker bindings and are mirrored onto `process.env` (via `nodejs_compat`) so the
+config lookups resolve.
+
+## Tools (config-driven)
+
+Tools are registered per tenant based on `projects.json` — a tenant only sees
+what its schema supports.
+
+| Tool family | When registered | Tools |
+| --- | --- | --- |
+| **Tasks** (per-user) | unless `"tasks": false` | `list_tasks`, `create_task`, `update_task`, `delete_task`, `assign_task`, `unassign_task` |
+| **Entities** (workspace-shared) | per `entities` entry | `list_<plural>`, `get_<singular>`, and — unless `readonly` — `create_/update_/delete_<singular>` |
+| **Prospects** (CRM pool) | `"prospects": true` | `create_prospect` (always attaches the `MCP` label) |
+
+Entities are fully declarative: each entry names the `table`, the writable
+`columns` allowlist, `required` fields, `search` columns, and any `arrayColumns`.
+Tool names and descriptions are generated from that — adding a `partners` table
+to a tenant is a config edit, not code.
+
+```json projects.json
+"things": {
+  "driver": "supabase-js",
+  "supabase_url": "https://emvrcccasxhtyreryvyq.supabase.co",
+  "service_key_env": "THINGS_SERVICE_KEY",
+  "entities": {
+    "customers": { "singular": "customer", "plural": "customers",
+      "table": "customers", "label": "company_name",
+      "required": ["company_name"],
+      "search": ["company_name", "contact_name", "contact_email"],
+      "columns": ["company_name", "contact_name", "labels", "…"],
+      "arrayColumns": ["labels", "aliases"] },
+    "partners": { "…": "…" },
+    "team":     { "…": "…" }
+  }
+}
+```
+
+<Note>
+  Tasks are **per-user** (filtered by the `{uuid}` — created-by or assigned-to).
+  Entities are **workspace-shared** — every member reads and writes them, but
+  `created_by` is still stamped with the acting user on insert.
+</Note>
+
+## Current tenants
+
+| `{repo}` | Backend | Tools |
+| --- | --- | --- |
+| `things` | Things Supabase | tasks + `customers` / `partners` / `team` entities |
+| `carmate` | Carmate Supabase | `leads` (read-only); tasks **off** |
+| `themis` | Themis Supabase | tasks + prospects |
+| `tflc` | Themis Supabase | tasks + prospects |
+| `companyfilms` | companyfilms Supabase | tasks only |
+
+Adding a tenant: add a key to `projects.json` with its `driver`,
+`supabase_url`/`database_url_env`, the `service_key_env` secret name, and
+optional `entities`/`prospects`/`tasks` flags — then `wrangler secret put` the
+key and deploy. `pg`-backed tenants only pull in the `pg` driver when first
+requested, so Supabase-only deploys stay lean.
+
+## The OAuth shim
+
+claude.ai's web connector refuses to attach an MCP server unless an OAuth
+handshake *completes* — even though `initialize` works anonymously. `oauth.ts`
+provides a **permissive shim**: discovery metadata, auto-approving `/authorize`,
+dynamic `/register`, and a throwaway bearer token at `/token`.
+
+<Warning>
+  This is **not** authentication. The MCP handlers ignore the `Authorization`
+  header entirely — the real capability is still the secret `{repo}/{uuid}` URL.
+  The token grants nothing extra; it only satisfies the client's OAuth dance so
+  the connector attaches. CORS is open for the same reason (browser connectors
+  preflight; capability is the URL, not the origin).
+</Warning>
