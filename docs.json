@@ -16,6 +16,13 @@
           "index",
           "quickstart"
         ]
+      },
+      {
+        "group": "Conventions",
+        "pages": [
+          "conventions/posthog",
+          "conventions/workflow-codes"
+        ]
       }
     ],
     "global": {

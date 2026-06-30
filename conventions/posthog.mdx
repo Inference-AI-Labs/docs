@@ -1,0 +1,82 @@
+---
+title: PostHog usage
+description: One shared PostHog project across all Flow tenants, filtered by a per-app tenant tag.
+---
+
+## One project, many tenants
+
+Every Flow app (carmate, tflc, **sujas**, picotin, …) sends to a **single shared
+PostHog project** on US cloud. We do **not** create a project per client. Apps
+are kept apart by a `tenant` tag attached to every event, so the shared project
+shows total traffic/errors and can be filtered down to one client.
+
+| Setting | Value |
+| --- | --- |
+| Host | `https://us.i.posthog.com` |
+| Project token | `NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN` (public, client-side; **same token for all tenants**) |
+| Tenant tag | per deployment — this one is `sujas` (Suja's Kitchen) |
+
+## The tenant tag
+
+Set once in `instrumentation-client.ts`, it stamps **every** event — including
+the `$exception` events from error tracking:
+
+```ts instrumentation-client.ts
+posthog.init(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN!, {
+  api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
+  defaults: "2025-05-24",
+  person_profiles: "identified_only",
+  capture_exceptions: true, // native error tracking → $exception events
+})
+
+// Tag every event with its tenant so the shared project filters per client.
+posthog.register({ tenant: "sujas" })
+```
+
+<Warning>
+  The `tenant` value must be unique per app and must **never** be left as a
+  copied-over value from another app (this repo originally shipped as
+  `"carmate"`). When you fork a Flow app, change this first — otherwise its
+  events blend into the wrong client.
+</Warning>
+
+## Config conventions
+
+- `person_profiles: "identified_only"` — anonymous visitors don't create person
+  profiles; only signed-in users do.
+- `capture_exceptions: true` — unhandled exceptions and promise rejections are
+  captured as `$exception` events (native PostHog error tracking). No separate
+  Sentry-style wiring needed for these.
+- `defaults: "2025-05-24"` — pin the defaults date so behavior doesn't drift
+  when the SDK updates.
+
+## Where the keys live
+
+Both vars are required. If either is missing, `posthog.init` runs with
+`undefined` and **no events are sent**.
+
+| Environment | How it's set |
+| --- | --- |
+| Local | `.env.local` (gitignored) |
+| Production | Vercel project env vars (`vercel env add … production`) |
+
+```bash
+# add to prod
+printf '<token>' | vercel env add NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN production
+printf 'https://us.i.posthog.com' | vercel env add NEXT_PUBLIC_POSTHOG_HOST production
+```
+
+## Server-side events
+
+Server code uses `posthog-node` via `lib/posthog-server.ts` for events captured
+outside the browser. The same project token and tenant convention apply.
+
+## Key event: `nav_clicked`
+
+Every sidebar navigation emits `nav_clicked` from `components/nav-main.tsx`:
+
+```ts
+posthog.capture("nav_clicked", { group, code, title, url })
+```
+
+The `code` field is the billable [workflow code](/conventions/workflow-codes).

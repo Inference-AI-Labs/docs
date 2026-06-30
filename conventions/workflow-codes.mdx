@@ -1,0 +1,65 @@
+---
+title: Workflow codes (W01…)
+description: Billable sidebar sections carry a stable W0x code sent to PostHog on every nav click.
+---
+
+## Why codes exist
+
+Each **billable workflow** is a section of the sidebar. We bill by usage, so
+each billable section carries a stable **code** — `W01`, `W02`, … — that is sent
+to PostHog on every navigation click. Billing counts by the code, not the label,
+so a section can be **renamed** without breaking historical billing.
+
+Internal surfaces (**Development**, **Admin**) are intentionally **uncoded** —
+they never bill.
+
+## How it's wired
+
+The code is passed per section in `components/app-sidebar.tsx`:
+
+```tsx components/app-sidebar.tsx
+<NavMain label="Sales & Marketing" code="W01" items={sales} />
+<NavMain label="Kitchen"           code="W02" items={kitchen} />
+<NavMain label="Archival"          code="W03" items={archival} />
+{/* Development and Admin: no `code` → never bill */}
+```
+
+`NavMain` threads `code` down to each `NavItem`, which attaches it to the
+`nav_clicked` event ([PostHog convention](/conventions/posthog)):
+
+```ts components/nav-main.tsx
+posthog.capture("nav_clicked", { group: label, code, title, url })
+```
+
+## Current mapping (Suja's Kitchen)
+
+| Code | Section | Items |
+| --- | --- | --- |
+| `W01` | Sales & Marketing | Create Menu, Proposals, Customers |
+| `W02` | Kitchen | Menu Bank, Mess Menu, Kitchen |
+| `W03` | Archival | Past Orders |
+| — | Development | _(uncoded — internal)_ |
+| — | Admin | _(uncoded — internal)_ |
+
+## Rules
+
+<Steps>
+  <Step title="Codes are stable and never reused">
+    Once a section has a code, it keeps it. A retired section's code is **not**
+    handed to a new one — that would corrupt historical billing.
+  </Step>
+  <Step title="Renaming is free">
+    Change a section's display `label` freely; the `code` stays. That's the
+    whole point — billing tracks the code.
+  </Step>
+  <Step title="New billable section → next free code">
+    Adding a billable section takes the next unused number (here, `W04`).
+  </Step>
+  <Step title="Reordering items inside a section changes nothing">
+    Items can move within a section or between sections without code changes;
+    only the section→code mapping matters for billing.
+  </Step>
+  <Step title="Internal surfaces stay uncoded">
+    Development and Admin must never carry a code, or they'd start billing.
+  </Step>
+</Steps>
