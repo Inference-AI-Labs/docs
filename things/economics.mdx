@@ -1,0 +1,190 @@
+---
+title: Economics — Claude Code session cost analytics
+sidebarTitle: Economics
+description: How the things app tracks per-client Claude Code effort and API cost — the econ_* tables in Supabase, the econ-sync scanner, its pricing model, and how to sync from the last synced date to now.
+---
+
+**Economics** is the P&L view in the internal `things` app (`/economics`, under
+Metrics in the sidebar). It answers, per client: how many Claude Code sessions
+we ran, how many tokens they burned, what that cost at API list rates, what the
+prompt cache saved, and how much active working time went in (valued at
+**$30/hr**). Stripe receipts, Supabase compute, and OpenRouter spend are matched
+per client on top to give a profit line.
+
+The numbers do **not** come from any API — they come from the local Claude Code
+session logs on the work machine, mirrored into Supabase by a sync script.
+
+## The pipeline
+
+<Steps>
+  <Step title="Source: local session logs">
+    Every Claude Code session writes a `.jsonl` file under
+    `~/.claude/projects/<dir>/<session-uuid>.jsonl`. Each assistant event in it
+    carries the model id and raw usage: `input_tokens`, `output_tokens`,
+    `cache_read_input_tokens`, and 5-minute / 1-hour cache-write token counts.
+  </Step>
+  <Step title="Scan: scripts/econ-sync.ts">
+    `npm run econ:sync` (in the `things` repo) scans **all** logs and keeps
+    sessions whose `cwd` falls inside the two client-work scopes:
+    `~/Documents/inference` (surface `inference`) and `~/Desktop/flow`
+    (surface `flow`). The leaf folder name becomes the project key
+    (`picotin-order` is canonicalised to `picotin`), and a label map turns keys
+    into display names (TFLC, Carmate, Suja's Kitchen, …). Internal keys
+    (`flow`, `things`, `deploy`, …) are flagged `is_internal`.
+  </Step>
+  <Step title="Mirror: econ_* tables in Supabase">
+    Rows are written per project, per session, and per (session, model) so the
+    UI can aggregate any way. Costs are computed at sync time; raw token counts
+    are stored so figures can be re-derived if rates change.
+  </Step>
+  <Step title="Serve: /economics">
+    `app/api/economics/route.ts` aggregates the tables per project, prices
+    active time at $30/hr, and matches external money — Stripe charges by
+    billing-email domain, OpenRouter by per-client API-key name, Supabase
+    compute by project name — into a per-client profit figure. Access is gated
+    by the `economics` feature key (Finance + Management departments).
+  </Step>
+</Steps>
+
+## The tables (exact shape)
+
+Created by `supabase/migrations/0040_economics.sql` in the `things` repo. RLS
+allows `select` to authenticated team members only; **writes happen exclusively
+through the sync script's service channel** — there are no write policies.
+
+### `econ_projects` — one row per client/folder
+
+| column | type | meaning |
+| --- | --- | --- |
+| `key` | `text` pk | canonical folder slug, e.g. `tflc`, `picotin` |
+| `label` | `text` | display name, e.g. `Suja's Kitchen` |
+| `surface` | `text` | `inference` \| `flow` — which scope root it lives in |
+| `is_internal` | `boolean` | internal work (not billable to a client) |
+| `paths` | `text[]` | every cwd seen for this project |
+| `updated_at` | `timestamptz` | stamp of the sync run that last touched it |
+
+### `econ_sessions` — one row per session
+
+| column | type | meaning |
+| --- | --- | --- |
+| `id` | `text` pk | session uuid — the `.jsonl` basename |
+| `project_key` | `text` fk → `econ_projects` | cascade delete |
+| `first_ts` / `last_ts` | `timestamptz` | first / last event in the log |
+| `active_seconds` | `integer` | active work time (see heuristic below) |
+| `user_prompts` | `integer` | human prompts sent |
+| `assistant_msgs` | `integer` | assistant messages with usage |
+| `synced_at` | `timestamptz` | stamp of the sync run that last touched it |
+
+### `econ_session_models` — one row per (session, model)
+
+| column | type | meaning |
+| --- | --- | --- |
+| `session_id`, `model` | composite pk | fk → `econ_sessions`, cascade |
+| `calls` | `integer` | assistant messages for this model |
+| `input_tokens` / `output_tokens` | `bigint` | raw uncached tokens |
+| `cache_read_tokens` | `bigint` | tokens read from prompt cache |
+| `cache_write_5m_tokens` / `cache_write_1h_tokens` | `bigint` | cache writes by TTL |
+| `cost_usd` | `numeric(14,4)` | computed at sync time (pricing below) |
+| `cache_savings_usd` | `numeric(14,4)` | what cache reads saved vs. full input rate |
+
+### `econ_sync_runs` — one row per sync
+
+| column | type | meaning |
+| --- | --- | --- |
+| `id` | `uuid` pk | |
+| `run_at` | `timestamptz` | **the "last synced" date** |
+| `sessions` | `integer` | sessions in that run's scan |
+| `total_tokens` | `bigint` | all token classes summed |
+| `total_cost_usd` | `numeric(14,4)` | estimated API cost of the whole scan |
+
+## Pricing model
+
+Cost is computed at sync time from a rate table in `scripts/econ-sync.ts`
+(API list rates, USD per 1M tokens):
+
+| model | input | output |
+| --- | --- | --- |
+| `claude-fable-5` | 10.00 | 50.00 |
+| `claude-opus-4-8` / `4-7` / `4-6` / `4-5` | 5.00 | 25.00 |
+| `claude-opus-4-1` | 15.00 | 75.00 |
+| `claude-sonnet-5` / `4-6` / `4-5` | 3.00 | 15.00 |
+| `claude-haiku-4-5` | 1.00 | 5.00 |
+| `claude-haiku-3-5` | 0.80 | 4.00 |
+
+Cache multipliers on the **input** rate: reads **0.10×**, 5-minute writes
+**1.25×**, 1-hour writes **2.0×**. Per (session, model):
+
+```
+cost_usd = (input·Pin + output·Pout + cache_read·Pin·0.10
+            + write_5m·Pin·1.25 + write_1h·Pin·2.0) / 1e6
+cache_savings_usd = cache_read·Pin·(1 − 0.10) / 1e6
+```
+
+<Note>
+  Unknown model ids price at $0 — if a new model appears in the logs, add it to
+  the `PRICE` table in `scripts/econ-sync.ts` and re-sync; token counts are
+  stored raw, so history reprices itself on the next run.
+</Note>
+
+**Active time** — the standard active-coding heuristic: gaps of ≤ 5 minutes
+between consecutive log events count as work, anything longer is idle.
+`active_seconds` is the sum. The UI prices it at $30/hr as the labor line.
+
+**Dedupe** — sessions get forked/resumed into new files carrying the same
+message ids. Files are scanned oldest-first (by mtime) with a global
+message-id set, so usage is attributed once, to the earliest session that
+produced it.
+
+## Syncing — from the last synced date to now
+
+There is **no incremental cursor to manage**. Every run is a full rescan of the
+logs and a full replace of the mirror, so "sync since the last date" is simply
+**run the script again** — it is idempotent on any cadence:
+
+```bash things repo
+npm run econ:sync
+```
+
+What one run does, in order: upsert all projects and sessions stamped with the
+run timestamp → wipe and re-insert **all** of `econ_session_models` → delete any
+session/project whose stamp is older than the run (i.e. its local log was
+cleaned up) → append one `econ_sync_runs` row.
+
+To see the last synced date (what the `/economics` header shows as
+`lastSyncedAt`):
+
+```sql
+select run_at, sessions, total_tokens, total_cost_usd
+from econ_sync_runs order by run_at desc limit 1;
+```
+
+And to see what a fresh run picked up since then, diff the two latest
+`econ_sync_runs` rows, or list sessions that moved:
+
+```sql
+select project_key, count(*) sessions, max(last_ts) latest
+from econ_sessions
+where last_ts > (select max(run_at) from econ_sync_runs where run_at < (select max(run_at) from econ_sync_runs))
+group by project_key order by latest desc;
+```
+
+### Write paths (first available wins)
+
+1. `npm run econ:sync -- --sql /tmp/econ.sql` — emit one idempotent SQL script
+   instead of pushing (run it through the Supabase MCP or psql).
+2. `SUPABASE_ACCESS_TOKEN` — push through the Supabase Management API.
+3. `SUPABASE_SECRET_KEY` — push through the service-role REST client.
+
+Env is read from the `things` repo's `.env.local`. Reference the secret
+**names** only — the values live in `.env.local` and nowhere else.
+
+<Warning>
+  The scan and the logs live on the work machine — running the sync anywhere
+  else produces an empty scan, and the prune step would then **delete every
+  session row**. Only sync from the machine that holds `~/.claude/projects`.
+</Warning>
+
+<Note>
+  The [/sync-work](/skills/sync-work) skill wraps all of this: it reads the
+  last `econ_sync_runs` row, runs the sync, and reports the delta per client.
+</Note>
