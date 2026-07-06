@@ -24,20 +24,21 @@ That's the whole interface. No arguments.
 
 <Steps>
   <Step title="Read the last sync">
-    Queries `econ_sync_runs` for the latest `run_at` and its totals — this is
-    the "since" date the report is anchored on.
+    Queries `econ_sync_runs` through the **Supabase MCP** (`execute_sql`) for
+    the latest `run_at` and its totals — this is the "since" date the report is
+    anchored on.
   </Step>
   <Step title="Run the sync">
     `npm run econ:sync` from the `things` repo. Pushes through the Supabase
-    Management API (`SUPABASE_ACCESS_TOKEN`) or the service-role client
-    (`SUPABASE_SECRET_KEY`), whichever `.env.local` provides; with neither, it
-    emits `--sql` and applies the script through the Supabase MCP.
+    Management API (`SUPABASE_ACCESS_TOKEN`) — the same channel the MCP uses —
+    falling back to the service-role client (`SUPABASE_SECRET_KEY`); with
+    neither, it emits `--sql` and applies the script through the Supabase MCP.
   </Step>
   <Step title="Report the delta">
     Diffs the new `econ_sync_runs` row against the previous one (sessions,
-    tokens, cost) and lists the clients whose sessions advanced past the old
-    `run_at` — so the summary reads "since July 4: 12 sessions across TFLC,
-    Picotin, Things — 89M tokens, est. $41.20".
+    tokens, cost) via the MCP and lists the clients whose sessions advanced
+    past the old `run_at` — so the summary reads "since July 4: 12 sessions
+    across TFLC, Picotin, Things — 89M tokens, est. $41.20".
   </Step>
 </Steps>
 
