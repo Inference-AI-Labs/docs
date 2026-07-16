@@ -32,7 +32,8 @@
           "workers/lead-listener",
           "workers/flow-mcp",
           "workers/flow-comments",
-          "workers/cpaas-listener"
+          "workers/cpaas-listener",
+          "workers/kapso-backup"
         ]
       },
       {

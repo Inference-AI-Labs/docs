@@ -1,0 +1,158 @@
+---
+title: kapso-backup — per-client WhatsApp backup
+sidebarTitle: kapso-backup
+description: A per-client scheduled Cloudflare Worker that mirrors a tenant's Kapso WhatsApp chats into D1 and their photos/media into R2 — because Kapso is the only copy and its media links expire.
+---
+
+**`kapso-backup`** is the standard backup job for **any client with a Kapso
+WhatsApp implementation**. A Flow WhatsApp inbox is a **read-through proxy**: the
+app stores nothing itself — it fetches conversations from `api.kapso.ai` on every
+view and renders photos straight from Kapso-hosted URLs. So if Kapso loses data,
+the account lapses, or a media link expires (they do), that history is gone.
+`kapso-backup` keeps a copy the client owns.
+
+<Note>
+  Unlike the shared [`*.takeflow.io` fleet](/workers/overview) (one deployment,
+  many tenants), this is a **per-client worker** — one deployment per app, living
+  inside that client's repo. Each client gets their **own** D1 database and R2
+  bucket. The reference implementation is the **rebound** app
+  (`~/Desktop/flow/rebound/cloudflare`).
+</Note>
+
+| | |
+| --- | --- |
+| Scope | **per-client** — one worker + one D1 + one R2 per app |
+| Location | `cloudflare/` inside the client's app repo (co-located, not the workers monorepo) |
+| Entry | `cloudflare/src/index.ts` (plain `fetch` + `scheduled` handlers) |
+| Deploy target | `<app>-backup.<account>.workers.dev` (e.g. `rebound-backup.takeflow.workers.dev`) |
+| Trigger | nightly cron `0 19 * * *` (~00:30 IST) + an `Authorization`-guarded fetch for on-demand runs |
+| Storage | D1 `<app>-backup` (chat + metadata) · R2 `<app>-media` (the bytes) |
+| Secrets | `KAPSO_API_KEY`, `BACKUP_TRIGGER_SECRET` |
+
+## Why two stores
+
+The chat text and the photo bytes have different shapes, so they go to different
+homes — linked by `media.r2_key`.
+
+- **D1** (`<app>-backup`) — cheap, queryable SQL for every message + who/when +
+  a pointer to the media. This is what makes old chats **searchable** (something
+  the live Kapso proxy can't do).
+- **R2** (`<app>-media`) — object storage for the actual image/video/audio/doc
+  bytes, kept **permanently** even after Kapso's link expires.
+
+```
+   api.kapso.ai ──(nightly worker)──►  D1  <app>-backup     text + metadata + r2_key ─┐
+   (the source)                        R2  <app>-media      the photo/media bytes ◄───┘
+```
+
+## Schema
+
+Three core tables (plus `backup_state` and `backup_runs` for bookkeeping). Media
+lives in R2; D1 only records where.
+
+```sql cloudflare/migrations/0001_whatsapp_backup.sql
+conversations (id, phone_number_id, contact_wa_id, contact_name,
+               last_message_at, synced_through_ms)
+messages      (id, conversation_id, wa_id, direction, type,
+               text_body, timestamp, raw)           -- raw = full Kapso payload
+media         (id, message_id, kapso_url, r2_key, mime_type,
+               sha256, size_bytes, caption)         -- r2_key → object in <app>-media
+```
+
+`messages.id` is the Kapso message id, so every write is an idempotent upsert —
+re-running never duplicates.
+
+## How a run works
+
+The worker pages the Kapso API and writes into D1 + R2. It's **idempotent and
+resumable**: a missed night, a mid-run timeout, or a manual re-trigger all just
+get caught up next time.
+
+<Steps>
+  <Step title="Enumerate">
+    `GET /platform/v1/whatsapp/phone_numbers`, then page
+    `GET /platform/v1/whatsapp/conversations` (`per_page=100`) for each number.
+  </Step>
+  <Step title="Decide what needs syncing">
+    Each conversation carries a `synced_through_ms` watermark. A conversation is
+    re-scanned only if its latest activity is newer than the watermark
+    (`NULL` ⇒ never synced ⇒ full backfill).
+  </Step>
+  <Step title="Back up messages">
+    `GET /platform/v1/whatsapp/messages` (`limit=500`, oldest-cursor paging with
+    a dedup guard), upserted into D1 in batches.
+  </Step>
+  <Step title="Back up media">
+    For each attachment, download the bytes and `put` them into R2 — skipping
+    anything already stored (`head` check). The watermark only advances once a
+    conversation's media is fully stored, so nothing is silently skipped.
+  </Step>
+</Steps>
+
+<Note>
+  `MAX_MEDIA_PER_RUN` (default `150`) caps downloads per invocation so a large
+  first backfill can't blow the runtime limit — it stops cleanly and resumes on
+  the next run. `MAX_MSG_PAGES` (default `40`) bounds message paging per
+  conversation.
+</Note>
+
+## Triggering a run
+
+The nightly cron runs automatically. To run on demand (e.g. the first backfill),
+hit the worker with the trigger secret in the **`Authorization` header**:
+
+```bash
+curl -X POST https://rebound-backup.takeflow.workers.dev \
+  -H "Authorization: Bearer $BACKUP_TRIGGER_SECRET"
+# → { "ok": true, "conversations": N, "messages": N, "media": N, "note": "" }
+```
+
+<Warning>
+  The secret is accepted **only** via the `Authorization` header (never a
+  `?key=` query param, which would land in access logs) and compared in constant
+  time. The Kapso key is attached to media downloads **only** for exact
+  `kapso.ai` / true-subdomain hosts, so a lookalike link can't harvest it.
+</Warning>
+
+## Standard setup (per client)
+
+From the client's app repo, with `wrangler` authenticated to the Flow Cloudflare
+account (`07f6a2e9…ae62f`):
+
+```bash
+# 1. provision the two stores
+wrangler d1 create <app>-backup
+wrangler r2 bucket create <app>-media
+
+# 2. add cloudflare/ (wrangler.jsonc + migrations + src/index.ts),
+#    paste the D1 id from step 1 into wrangler.jsonc, then:
+cd cloudflare
+wrangler d1 migrations apply <app>-backup --remote
+wrangler deploy
+
+# 3. secrets (values via stdin/prompt — never on the CLI or in logs)
+grep '^KAPSO_API_KEY=' ../.env.local | sed -E 's/^KAPSO_API_KEY=//; s/^"//; s/"$//' \
+  | wrangler secret put KAPSO_API_KEY
+wrangler secret put BACKUP_TRIGGER_SECRET   # a freshly generated token
+
+# 4. kick off the first full-history backfill (see "Triggering a run")
+```
+
+<Note>
+  `wrangler.jsonc` is committed — it holds only the D1 id and bucket name, no
+  secrets. The generated trigger token lives in `cloudflare/.dev.vars`
+  (gitignored). Copy the reference implementation from the **rebound** repo and
+  swap the resource names.
+</Note>
+
+## What it does *not* change
+
+The inbox UI is untouched — it keeps reading Kapso **live**, so the backup can
+never affect the working product. The store is a silent, owned copy that unlocks
+durability, permanent photos, search/analytics over history, and a compliance
+trail.
+
+The natural next step (per client, when wanted) is an **R2 photo fallback**: the
+UI still reads chats live from Kapso, but when a photo's Kapso link has expired,
+it resolves the permanent copy from R2 — the point at which "photos never rot"
+actually reaches users.

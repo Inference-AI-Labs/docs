@@ -39,6 +39,16 @@ segment).
   </Card>
 </CardGroup>
 
+## Per-client workers
+
+The map above is the **shared** fleet — one deployment, many tenants. A second
+pattern exists for jobs that are naturally per-client and live **inside a
+client's app repo** rather than the workers monorepo:
+
+- [**kapso-backup**](/workers/kapso-backup) — a nightly worker that mirrors a
+  tenant's Kapso WhatsApp chats into their own D1 + R2. One deployment per app
+  (`<app>-backup.…workers.dev`), not a `takeflow.io` subdomain.
+
 ## How tenancy works
 
 There is no per-client deployment of these workers — **one worker, many
