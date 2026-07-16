@@ -79,8 +79,9 @@ get caught up next time.
     (`NULL` ⇒ never synced ⇒ full backfill).
   </Step>
   <Step title="Back up messages">
-    `GET /platform/v1/whatsapp/messages` (`limit=500`, oldest-cursor paging with
-    a dedup guard), upserted into D1 in batches.
+    `GET /platform/v1/whatsapp/messages` — Kapso pages newest-first with
+    `page` / `per_page` (**max 100** per page; `limit` > 100 is rejected), so we
+    walk pages until a short one, then upsert into D1 in batches.
   </Step>
   <Step title="Back up media">
     For each attachment, download the bytes and `put` them into R2 — skipping
@@ -89,12 +90,18 @@ get caught up next time.
   </Step>
 </Steps>
 
-<Note>
-  `MAX_MEDIA_PER_RUN` (default `150`) caps downloads per invocation so a large
-  first backfill can't blow the runtime limit — it stops cleanly and resumes on
-  the next run. `MAX_MSG_PAGES` (default `40`) bounds message paging per
+<Warning>
+  **Cloudflare caps subrequests per invocation** — every Kapso fetch, R2 `put`,
+  and D1 **batch** (a whole batch counts as *one*) — at **50 on the free Workers
+  plan**, 1000 on Paid. `MAX_OPS_PER_RUN` (default `45`) keeps each run just
+  under the free ceiling and stops cleanly; the watermark only advances for
+  fully-stored conversations, so the next run resumes exactly where it left off.
+  On the free plan a large first backfill therefore takes **several runs** to
+  drain (loop the trigger, or let the nightly cron catch up); the incremental
+  nightly delta is tiny. Bump `MAX_OPS_PER_RUN` to ~950 if the account moves to
+  Workers Paid. `MAX_MSG_PAGES` (default `40`) bounds message paging per
   conversation.
-</Note>
+</Warning>
 
 ## Triggering a run
 
