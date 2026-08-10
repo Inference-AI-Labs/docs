@@ -1,0 +1,232 @@
+---
+title: billing — billing.takeflow.io
+sidebarTitle: billing
+description: The ledger, and the only holder of the central keys — two auth modes, a signed-request contract, its own D1 for money and the things DB for identity.
+---
+
+**billing** is the money worker. It holds the central Stripe key and the
+`things` service key, so no client app ever has to: an app knows only its own
+signing secret, asks this worker, and gets back its own line and nobody else's.
+
+It runs at `billing.takeflow.io` and nowhere else — `workers_dev` and
+`preview_urls` are both `false` in `wrangler.jsonc`, because the same money
+endpoints on an unwatched hostname is the whole risk.
+
+Source lives at `~/Documents/takeflow/things/workers/billing`.
+
+<Warning>
+  The worker was uploaded straight to Cloudflare on 2026-07-14 and its source
+  was never committed. The tree was reconstructed on 2026-07-31 from the
+  deployed bundle and verified by diffing a rebuild against it. **Deploy from
+  the repo from now on** — a worker whose source exists only inside Cloudflare
+  is one dashboard mistake from being unrecoverable.
+</Warning>
+
+## Two registries, two questions
+
+The split that explains the whole design:
+
+| Registry | Owns | Reached by |
+| --- | --- | --- |
+| **D1** (`billing` database, binding `DB`) | Money — what was paid, what is owed, the meter snapshot | the worker's own binding |
+| **things** (central Supabase) | Identity — who the client is, their package, add-ons, workflows, contacts | PostgREST with `THINGS_SERVICE_KEY` |
+
+A tenant therefore has a row in *both*, keyed differently: D1 by `tenants.id`
+with an `api_key`, things by `tenants.supabase_ref` with a `signing_secret`.
+
+## Four ways in
+
+| Auth | Routes | Who calls it |
+| --- | --- | --- |
+| **Bearer** — `tenants.api_key` from D1 | `GET /balance`, `GET /payments`, `POST /checkout` | client usage pages (dmn, picotin) |
+| **Signed** — HMAC keyed by `tenants.signing_secret` in things | `GET /workflows`, `GET /plan`, `POST /switch-annual`, `POST /email-invoice` | client billing pages (sujaskitchen) |
+| **Admin** — `ADMIN_KEY` bearer | `GET/POST /admin/tenants` | operators |
+| **Stripe** — webhook signature | `POST /stripe` | Stripe |
+
+## The signed-request contract
+
+This is the part every client app implements. Three headers:
+
+```
+x-tenant-ref: <the caller's Supabase project ref>   → tenants.supabase_ref in things
+x-timestamp:  <unix seconds>                        → must be within 5 minutes
+x-signature:  hex HMAC-SHA256 over `${ts}.${METHOD}.${path}.${body}`
+```
+
+Body is the empty string on `GET`. Binding **method and path** into the signed
+string means a captured signature can't be replayed against a different route;
+the timestamp window (`SIGNATURE_WINDOW_SECONDS = 300`) means it can't be
+replayed later at all. Comparison is `crypto.subtle.timingSafeEqual`.
+
+The client half lives in one file per app so the signed string can't drift:
+
+```ts app/(app)/admin/billing/signed-fetch.ts
+const sig = crypto
+  .createHmac("sha256", secret)
+  .update(`${ts}.${method}.${path}.${body}`)
+  .digest("hex");
+```
+
+The tenant ref is **derived, not configured** — it's the project ref parsed out
+of `NEXT_PUBLIC_SUPABASE_URL`, so an app can only ever sign as itself.
+
+<Note>
+  A signed request with an unknown ref and one whose tenant has no
+  `signing_secret` both return the same `401 unknown tenant`. Distinguishing
+  them would let a caller probe the registry.
+</Note>
+
+## Routes
+
+### `GET /workflows` — signed
+
+The workflows a client actually runs, from the things catalog.
+`workflow_placements` is the whole catalog, one row per workflow, with
+`client_ids` naming who runs it — so "this client's workflows" is a containment
+query (`client_ids=cs.{"<tenant-id>"}`) and attaching a workflow in the things
+UI is the entire update. Nothing is cached; the caller's page is the cache.
+
+Returns `{ tenant, customer_name, count, workflows[] }` where each workflow
+carries `id, title, description, category, stage, icon`.
+
+### `GET /plan` — signed
+
+The tenant's whole billing profile: package, add-ons, subscription cents,
+status, start date, the card on file, the annual offer, and every invoice.
+
+<Steps>
+  <Step title="Read the tenant from things">
+    `package`, `package_price_id`, `add_ons`, `subscription_cents`,
+    `stripe_customer_id`, `status`, `start_date`, `email`, `emails`.
+  </Step>
+  <Step title="Resolve Stripe customers by email">
+    Attribution is by **email, not `stripe_customer_id`**. Most tenants have no
+    customer id on file — they were invoiced before it was recorded, or paid
+    through a link that made its own customer — so keying on the id returns
+    nothing for exactly the accounts with the longest history. The `emails`
+    array in things is the durable identity: add an address there and its
+    invoices appear on the next load.
+  </Step>
+  <Step title="List invoices per customer">
+    Merged, deduped by id, newest first.
+  </Step>
+  <Step title="Sweep guest charges">
+    Someone who paid through a payment link may have no customer record at all.
+    Stripe does **not** index `billing_details.email` on charges, so
+    `charges.search` fails outright — instead the worker walks recent charges
+    newest-first, bounded at `GUEST_SCAN_PAGES × 100` (5 × 100), and matches the
+    email in code. Bounded so a busy account can't turn a page load into a
+    full-history crawl.
+  </Step>
+  <Step title="Find the card and the annual price">
+    The card comes from whichever customer has a default payment method. The
+    annual price is **discovered, not configured** — see below.
+  </Step>
+</Steps>
+
+The response also carries a `probe` (customers and charges found per email) and
+`problems`, so "no invoices" can be told apart from "the lookup failed" — those
+need opposite fixes.
+
+### `POST /switch-annual` — signed
+
+Creates a Stripe Checkout session that moves the account onto its package's
+annual price, and returns the `url` for the browser to follow.
+
+The annual price is found rather than stored: the monthly price already names a
+Stripe product, and the yearly price is another active price on that same
+product with `recurring.interval === "year"`. Add a yearly price to the product
+in Stripe and the offer appears — there is nothing to keep in step. This
+replaced `annual_upgrade_url`, a hand-pasted Payment Link that was null for most
+tenants and turned the upgrade into a dead end.
+
+<Warning>
+  Add-ons must move onto the annual term too — Stripe won't mix intervals inside
+  one subscription. If any add-on has no yearly price the route returns **400
+  with the missing names** rather than checking out the package alone. A
+  checkout that silently drops an add-on looks like it worked and leaves the
+  account paying for less than it uses.
+</Warning>
+
+### `POST /email-invoice` — signed
+
+Sends the customer another copy of a receipt. A real invoice (`in_…`) is re-sent
+with `invoices.sendInvoice`; anything else is a charge, and re-asserting
+`receipt_email` makes Stripe issue the receipt again.
+
+Stripe does the sending, not the invoice-sender worker — that worker is a
+webhook receiver, it only accepts a POST carrying a valid `stripe-signature`, so
+there is no way to ask it for a copy without forging one.
+
+### `GET /balance`, `GET /payments`, `POST /checkout` — bearer
+
+The usage-page trio, for apps that settle a running balance rather than sit on a
+subscription.
+
+`computeBalance` reads the **last settlement's `usage_snapshot_cents`** as the
+meter reading, so usage due is `(usage_total − snapshot) × usage_multiplier`,
+floored at zero. Subscription due is charged only if no payment exists for the
+current `period_month`. `POST /checkout` refuses under 50¢ and writes the new
+snapshot into the session metadata — set **only** when the app reported usage,
+so a subscription-only settle can't move the meter.
+
+### `POST /stripe` — webhook
+
+`checkout.session.completed` (paid only) and `invoice.payment_succeeded` insert
+into `payments` with `INSERT OR IGNORE`, attributed by `metadata.tenant` or,
+failing that, by lowercased `billing_email`. Unattributed payments are logged
+as `unattributed_payment` and ignored rather than guessed at.
+
+A completed annual switch (`metadata.switch_annual === "1"`) also **writes back
+to things** — new `package_price_id`, `subscription_cents` stored as the
+monthly-equivalent (`annual / 12`), and the paying customer becomes
+`stripe_customer_id`. Without that the customer pays and every surface still
+says monthly. If the write-back fails, the payment is still recorded and an
+`annual_switch_writeback_failed` line is logged so the row can be fixed by hand.
+
+### `/admin/tenants` — admin key
+
+`POST` upserts a D1 tenant (`id`, `name`, `billing_email`, `subscription_cents`,
+`subscription_qty`, `usage_multiplier`, optional `rotate_key`) and returns the
+generated `tk_…` API key on create or rotate. `GET` lists tenants with payment
+count and collected cents.
+
+## Secrets
+
+```bash
+wrangler secret put ADMIN_KEY             --name billing
+wrangler secret put STRIPE_SECRET_KEY     --name billing
+wrangler secret put STRIPE_WEBHOOK_SECRET --name billing
+wrangler secret put THINGS_URL            --name billing   # https://<ref>.supabase.co
+wrangler secret put THINGS_SERVICE_KEY    --name billing
+```
+
+For local dev put the same **names** in `.dev.vars` (gitignored). Reference
+names only — never values.
+
+<Warning>
+  **`STRIPE_WEBHOOK_SECRET` has never been set.** Verified against
+  `wrangler secret list --name billing` on 2026-08-10: only `ADMIN_KEY`,
+  `STRIPE_SECRET_KEY`, `THINGS_URL` and `THINGS_SERVICE_KEY` exist. Every
+  `POST /stripe` therefore fails signature verification with a zero-length HMAC
+  key, so **no payment has ever been recorded** — `payments` has had zero rows
+  since 2026-07-14. Set the secret, then replay the failed events from the
+  Stripe dashboard.
+
+  Note what this does and does not break: `/plan` reads invoices from Stripe
+  live, so a client's billing page still shows their real invoices. It is the D1
+  ledger — balances, settlement snapshots — that is empty.
+</Warning>
+
+## Deploying
+
+```bash
+cd ~/Documents/takeflow/things/workers/billing
+wrangler deploy
+```
+
+## See also
+
+- [Billing meters](/conventions/billing-meters) — the client-app half: the six
+  meters on a tenant's `/admin/billing` page and where each number comes from.
+- [Workers overview](/workers/overview) — the rest of the fleet.

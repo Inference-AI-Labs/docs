@@ -21,7 +21,8 @@
         "group": "Conventions",
         "pages": [
           "conventions/posthog",
-          "conventions/workflow-codes"
+          "conventions/workflow-codes",
+          "conventions/billing-meters"
         ]
       },
       {
@@ -33,6 +34,7 @@
           "workers/flow-mcp",
           "workers/flow-comments",
           "workers/cpaas-listener",
+          "workers/billing",
           "workers/kapso-backup"
         ]
       },

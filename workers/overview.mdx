@@ -1,7 +1,7 @@
 ---
 title: Workers overview
 sidebarTitle: Overview
-description: The five Cloudflare Workers behind *.takeflow.io — one monorepo, one account, all tenant-based.
+description: The Cloudflare Workers behind *.takeflow.io — one account, all tenant-based.
 ---
 
 Flow's backend edge runs on a small set of **Cloudflare Workers**, all in one
@@ -20,6 +20,7 @@ segment).
 | `mcp.takeflow.io` | [**flow-mcp**](/workers/flow-mcp) | Per-tenant MCP server — tasks, customers, partners, team, prospects |
 | `cx.takeflow.io` | [**flow-comments**](/workers/flow-comments) | Collects client feedback + attachments |
 | `cpaas.takeflow.io` | [**cpaas-listener**](/workers/cpaas-listener) | Receive-only CPaaS (call/recording) webhooks for clients |
+| `billing.takeflow.io` | [**billing**](/workers/billing) | The ledger — plan, invoices, Stripe checkout; sole holder of the central keys |
 
 <CardGroup cols={2}>
   <Card title="takeflow" icon="diagram-project" href="/workers/takeflow">
@@ -37,7 +38,16 @@ segment).
   <Card title="cpaas-listener" icon="phone-arrow-down-left" href="/workers/cpaas-listener">
     Path-token tenants, per-provider call webhook normalization.
   </Card>
+  <Card title="billing" icon="credit-card" href="/workers/billing">
+    Signed + bearer routes over D1 (money) and things (identity), plus Stripe.
+  </Card>
 </CardGroup>
+
+<Note>
+  **billing** is shared and tenant-based like the rest, but its source lives in
+  the `things` repo (`~/Documents/takeflow/things/workers/billing`) rather than
+  the workers monorepo — it is deployed from there.
+</Note>
 
 ## Per-client workers
 
@@ -62,6 +72,7 @@ config (and secrets) from a bundled file:
 | flow-mcp | `{repo}` URL segment | `projects.json` |
 | flow-comments | `X-Workspace-Url` header | _(single Supabase, scoped by column)_ |
 | takeflow | flow `id` in the path | _(KV-keyed)_ |
+| billing | `x-tenant-ref` header (signed) or `Authorization` bearer | _(its own D1 `tenants` + `tenants` in things)_ |
 
 <Note>
   Config files (`clients.json`, `projects.json`) are committed and reference

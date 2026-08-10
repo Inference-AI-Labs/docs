@@ -1,0 +1,241 @@
+---
+title: Billing meters
+description: The six meters on a client app's /admin/billing page — what each one counts, which system it reads, and how a period bounds it.
+---
+
+Every Flow client app carries an admin-only `/admin/billing` page. It answers
+two questions: **what is this account on**, and **what did it use**. The first
+comes entirely from the [billing worker](/workers/billing) over one signed call.
+The second is measured by the app itself, from its own resources, through six
+meters.
+
+The rule the page is built on: the worker holds the central keys, the app holds
+only its own. Anything central — plan, price ids, add-ons, card, invoices — is
+asked for. Anything the app already owns — its user table, its Kapso account,
+its slice of the shared PostHog project — is counted locally.
+
+## The period
+
+Every meter counts against a **period**: one calendar month in UTC, written
+`YYYY-MM`, resolved in `lib/billing/period.ts`. It arrives from the URL
+(`?period=2026-07`) and anything unparseable or in the future resolves back to
+the current month rather than rendering an impossible one.
+
+UTC rather than Dubai time because that is what the meters' own sources use —
+PostHog timestamps, Kapso dates and Postgres `timestamptz` are all compared in
+UTC, and shifting the boundary four hours would move calls between months.
+
+Bounds are half-open: `>= startIso`, `< endIso`. A closed upper bound would
+either drop the last instant of the month or double-count it into the next.
+
+<Note>
+  The period is what lets last month's invoice be checked against the usage that
+  produced it. Before it existed each meter hardcoded "since the start of this
+  month", so the page could only ever answer one question.
+</Note>
+
+## The six meters
+
+| Meter | Counts | Read from |
+| --- | --- | --- |
+| **Intelligence** | AI model spend this cycle | PostHog `$ai_generation`, priced by the model-library worker |
+| **Users** | Seats in use | the app's own `profiles` table |
+| **MCP calls** | Assistant tool calls | PostHog `mcp_request` |
+| **Messaging** | WhatsApp messages | Kapso |
+| **Workflows** | Automations running on the account | things, via `GET /workflows` |
+| **Enrichment** | Verified contacts | the app's own `prospects` table |
+
+### Intelligence
+
+Usage is priced **by the slab rate for whichever profile served each call** —
+not by marking up what the gateway charged. A markup on cost meant a cheaper
+model earned us less, which is backwards.
+
+Calls are read from the shared PostHog project, grouped by day **and model**,
+because the price of a call is a function of which profile served it — a day's
+token count alone can't be priced:
+
+```sql
+SELECT toDate(timestamp) AS day, properties.$ai_model AS model,
+       sum(toFloat(properties.$ai_input_tokens))  AS tokens_in,
+       sum(toFloat(properties.$ai_output_tokens)) AS tokens_out,
+       sum(toFloat(properties.$ai_total_cost_usd)) AS cost,
+       count() AS calls
+FROM events
+WHERE event = '$ai_generation'
+  AND properties.openrouter_api_key_name = '<key name>'
+  AND timestamp >= '<start>' AND timestamp < '<end>'
+GROUP BY day, model
+```
+
+Those model ids go to the **model-library worker**, which sorts each model onto
+a Low/Medium/High slab by intelligence index and prices the call. Profiles come
+back; nothing downstream holds a model name. It **throws rather than returning a
+partial answer** — a panel that silently dropped the calls it couldn't price
+would quietly under-bill, which is worse than showing nothing.
+
+<Warning>
+  `$ai_generation` carries **no tenant property** — the gateway key's name is
+  the only thing separating one client's calls from another's. So the meter
+  refuses to query at all unless `POSTHOG_AI_KEY_NAME` is set, rather than
+  falling back to an unscoped total. No figure beats a figure that belongs to
+  someone else.
+</Warning>
+
+**Included allowance** — `$50` of model spend is covered by the plan. The panel
+splits the cycle into "Included" and "Beyond included" (or "Remaining" as a
+ghost segment when under), so the bar spans the same width either way.
+
+**Research** is separate: Exa web search and answers, read through the
+exa-handshake worker and billed at **3× cost**, not by tokens — Exa bills per
+request ($7/1k search, $5/1k answer), so there is no token slab to price it
+against and the markup is the price. Research spend is not covered by the
+included allowance.
+
+### Users
+
+A count of `profiles`, excluding our own operators:
+
+```
+email.is.null,email.not.ilike.%@inference.so
+```
+
+Operators don't consume a seat. The tile and the statement use the same
+exclusion so they can't disagree.
+
+### MCP calls
+
+`mcp_request` events in the shared PostHog project, scoped by
+`properties.tenant` (the [tenant tag](/conventions/posthog), from
+`POSTHOG_TENANT`) and the period. The statement also surfaces failures
+(`req_status != 'ok'`) and distinct tools used.
+
+### Messaging
+
+WhatsApp messages from Kapso, summed across every connected phone number.
+
+Kapso's message endpoint **takes no date range**, so the period is applied after
+the fetch — pages still have to be walked in full. The walk is capped at
+`MAX_PAGES = 40` (× 100 = 4,000 messages per number); when the cap trims a
+tally, the note says so, because a silent truncation would turn "here's what you
+sent" into a lie. Messages are bucketed into chats, voice, images, PDFs, files
+and video; the four the statement always shows stay visible at zero, since "no
+voice notes at all" is an answer.
+
+<Note>
+  The **tile** and the **statement** count differently. The tile sums Kapso's
+  own `messages_count` per conversation, which is a lifetime counter — it is not
+  period-bounded. The statement walks the messages and filters them to the
+  period. Expect the tile to read higher than the statement on any month that
+  isn't the account's first.
+</Note>
+
+### Workflows
+
+The one meter that isn't measured locally: `GET /workflows` on the billing
+worker returns the rows of the things `workflow_placements` catalog whose
+`client_ids` contain this tenant. Attaching a workflow in things is the whole
+update.
+
+A workflow in stage `hard-lift` (in build) or `disposed` (retired) **isn't
+running**, so it isn't counted in the headline — the rule lives in one place
+(`isLive`) rather than at each call site, or the sheet would contradict the tile
+that opened it. A `null` list means the worker didn't answer; the tile shows 0
+and the statement says why when opened.
+
+### Enrichment
+
+Prospects with `verified = true` and `enriched_at` inside the period, billed at
+**$0.50 per verified contact**.
+
+An enrichment that came back without a deliverable address **isn't charged** —
+it cost us the lookup but gave you nothing to use — so counting every enrichment
+would put a number on the tile that the statement then contradicts. A prospect
+stores only its most recent enrichment, so re-enriching the same one within a
+cycle bills once, not twice.
+
+## Statements: two stages
+
+Every meter answers the same question — "what made this number?" — so they share
+one envelope and one renderer, delivered in two stages:
+
+<Steps>
+  <Step title="Overview — the total">
+    One aggregate, or one page of an API. Headline stats, an optional split bar
+    and a daily series. Fast enough to paint immediately.
+  </Step>
+  <Step title="Detail — the itemisation">
+    A group-by, a full list, or a paginated crawl. Always carries a `note`
+    saying where the numbers came from, so no figure on the panel is
+    unattributed.
+  </Step>
+</Steps>
+
+The two are fetched concurrently, so the wall-clock cost is the slower of the
+pair rather than the sum. Values arrive **pre-formatted** — the client sheet is
+a dumb renderer, and the money conventions stay next to the data.
+
+One of those conventions is worth copying: a single model call can cost a
+hundredth of a cent, and two decimals turns a screen of them into `$0.00`, which
+reads as *free* rather than as *small*. So the smaller the number, the more
+digits are shown.
+
+## Authorisation
+
+The page is admin-only, but **a server action is its own entry point**.
+Middleware gates page navigations, not posted actions, and an action id is
+global — it can be invoked from any page the caller is allowed to open. So every
+billing action re-checks the role itself:
+
+```ts app/(app)/admin/billing/statement-actions.ts
+if (!(await isAdmin())) return { ...shell, error: "Not authorised." };
+```
+
+Both stages check. They are two separate requests, and the second is not vouched
+for by the first.
+
+<Warning>
+  Use the shared `requireAdmin()` guard rather than reading `profiles.role`
+  directly. The shared one **resolves impersonation** — while an admin views the
+  app as a member, the effective role is that member's, and admin-only data must
+  stay shut. The same applies to the actions that mail an invoice or start an
+  annual switch: those spend real money on a real customer's account.
+</Warning>
+
+Client-supplied `periodKey` values are resolved, never trusted — anything
+unparseable or in the future lands on the current month.
+
+## Configuration
+
+Reference secret **names** only; values live in each app's `.env.local`.
+
+| Variable | Used for |
+| --- | --- |
+| `TAKEFLOW_BILLING_SECRET` | signs every call to the billing worker |
+| `BILLING_WORKER_URL` | override the fixed `https://billing.takeflow.io` for local dev |
+| `NEXT_PUBLIC_SUPABASE_URL` | the project ref is parsed from it as `x-tenant-ref` |
+| `POSTHOG_PERSONAL_API_KEY`, `POSTHOG_PROJECT_ID`, `POSTHOG_QUERY_HOST` | HogQL queries against the shared project |
+| `POSTHOG_TENANT` | scopes the MCP meter to this client |
+| `POSTHOG_AI_KEY_NAME` | scopes the Intelligence meter — **without it the meter refuses to answer** |
+| `MODEL_LIBRARY_URL` | the pricing worker |
+| `OPENROUTER_API_KEY` | the gateway key's own spend rollup |
+| `EXA_API_KEY`, `EXA_HANDSHAKE_URL` | research spend, via the handshake worker |
+| `KAPSO_API_KEY` | the messaging meter |
+
+## Failure posture
+
+The consistent choice across this page: **show nothing rather than something
+wrong.** A meter that can't reach its source returns an error string the panel
+renders, not a zero. A zero on a billing page is a claim — "nothing was spent" —
+and that is a different statement from "we couldn't ask".
+
+The one deliberate exception is the workflows tile, where `0` is shown on the
+card and the explanation waits inside the statement.
+
+## See also
+
+- [billing worker](/workers/billing) — the routes these meters call, and the
+  signed-request contract.
+- [PostHog usage](/conventions/posthog) — the shared project and the tenant tag.
+- [Workflow codes](/conventions/workflow-codes) — the `W0x` codes billable
+  sidebar sections carry.
