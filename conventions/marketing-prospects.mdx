@@ -1,0 +1,146 @@
+---
+title: Marketing Prospects — the prospect pool, research and enrichment
+sidebarTitle: Marketing Prospects
+description: How a client app's Marketing Prospects module works — the two screens (Prospects, Research), the single prospects table it shares with the Prospects pipeline, the Exa and Apollo keys, the trash table for verified contacts, and how verified emails reach the bill at $0.50 each.
+---
+
+**Marketing Prospects** is the pipeline-side module in a client app where the
+team builds and works a pool of people worth approaching. It's reached from the
+sidebar under Pipeline (`/marketing/prospects`, feature key
+`marketing_prospects`) and comes as **two screens** behind two buttons in the
+header:
+
+| Button | What it does | Where |
+| --- | --- | --- |
+| **Prospects** | The pool: search, filter, edit inline, add by hand, enrich one row | `/marketing/prospects` |
+| **Research** | Web research on one prospect, gathered by Exa and kept as a versioned board | `/marketing/research` (feature key `marketing_research`) |
+
+The Prospects screen also carries an **Enrich** mode: a Google-style search box
+that asks Exa for candidates ("HR managers at Jafza logistics companies") and
+saves the ones you pick straight into the pool.
+
+## One table, not two
+
+The pool **is `public.prospects`** — the same table the `/prospects` pipeline
+and the outbound board read. There is no separate marketing table any more: the
+module used to keep its own `marketing_prospects`, which stayed empty while the
+real rows lived in `prospects`, so it was folded in (migration
+`0076_merge_marketing_prospects`). What Marketing Prospects needed and
+`prospects` lacked was added as columns:
+
+| Column | Meaning |
+| --- | --- |
+| `verified` | The email is confirmed deliverable. **The single billing flag** — see below. |
+| `avatar_path` / `avatar_url` | Photo: object path in the private `sales_storage` bucket, or a direct external URL when the bucket write wasn't possible. Served through `/api/marketing-prospects/avatar`. |
+| `enriched_at` | When the row was last enriched (and, for billing, when it was verified). |
+| `assigned_to` | Owner — a `profiles.id`. Backfilled from the old batch names ("Kenya - Farah") in `0078`. |
+
+Everything else the screen shows — status, quality, labels, notes, next
+follow-up, batch, source — is the pipeline's own schema (`0034_prospects`).
+Both screens read only rows with `pipeline = 'prospect'`; a prospect converted
+to outbound leaves the marketing view the same way it leaves `/prospects`.
+
+<Note>
+  Research boards (`prospect_research_boards`) hang off `prospects.id` with
+  `on delete cascade`. One row per research run, so an earlier board is never
+  overwritten by a later, worse one.
+</Note>
+
+## Keys: Exa and Apollo
+
+Two upstreams, both per tenant, both env vars on the app's own deployment —
+never central:
+
+| Key | Used for | Where it's read |
+| --- | --- | --- |
+| `EXA_API_KEY` | Enrich-mode candidate search (`/api/marketing-prospects/enrich`), per-row enrichment (category + photo lookup, `lib/marketing-prospects/enrich.ts`), Research boards and follow-up questions (`/api/marketing-prospects/research`, `…/research/ask`) | server routes only |
+| `APOLLO_API_KEY` | Per-row enrichment (`/api/marketing-prospects/[id]/enrich`): people match, personal email, phone reveal | server route only |
+
+**Exa is a per-tenant key.** Every client app holds its own, so Exa's own
+usage report is what separates one tenant's research spend from another's. But
+Exa's usage endpoint needs a **team-management service key** that can read
+*every* client's usage on the team — so that service key lives in one place, the
+**exa-handshake worker** (`https://exa.takeflow.io`), and the app sends the Exa
+key it already holds and gets back only its own line. Possession of the tenant
+key is the authorisation. That flow is documented on the
+[billing meters](/conventions/billing-meters) page (Intelligence → Research);
+the app never sees the service key.
+
+**Apollo** is asked once per row when someone clicks Enrich. Phone numbers come
+back asynchronously to `/api/marketing-prospects/phone-webhook`, which writes
+with the service-role client because Apollo isn't a signed-in user. When Apollo
+reports `email_status = "verified"`, the route sets `verified = true` and
+stamps `enriched_at`.
+
+<Warning>
+  Reference the names only. `EXA_API_KEY`, `APOLLO_API_KEY` and
+  `SUPABASE_SERVICE_ROLE_KEY` are set per deployment; none of them belong in
+  client code, screenshots or this page.
+</Warning>
+
+## Verified: one flag
+
+`prospects.verified` is the only thing that means "this prospect has a verified
+email". Rows imported from the earlier Enrichment app carried it in
+`match_status` text (`verified`, `VERIFIED (Apollo)`, `VERIFIED but ORG
+MISMATCH`) with the flag left false; migration `0079` folded those in and set
+their `enriched_at` to their import time, so they landed on the month they were
+verified in. The screen shows a green check next to the name; nothing reads
+`match_status` for billing.
+
+## Trash: verified prospects never just vanish
+
+Deleting a verified prospect deletes billable work that already happened. So
+`public.prospects` carries a `BEFORE DELETE` trigger
+(`prospects_trash_on_delete`): if the row is verified it is copied into
+**`public.prospects_trash`** first — same columns, plus the label names at the
+moment of deletion, `deleted_at` and `deleted_by`. Then the delete proceeds.
+
+- The trigger is `SECURITY DEFINER`, so any client that may delete a prospect
+  fills the trash without needing write access to it. `prospects_trash` is
+  read-only to signed-in members; nothing but the trigger (or an operator with
+  the service key) writes it.
+- Rows are populated **by column name** through `jsonb_populate_record`, not
+  positionally — a column added to `prospects` later can't shift values into the
+  wrong slot.
+- Unverified rows are simply deleted. They were never on the bill.
+
+Restoring one is a manual `insert into prospects select … from prospects_trash`
+by an operator; there is no UI for it on purpose.
+
+## Billing: $0.50 per verified email
+
+The Enrichment meter on `/admin/billing` bills **$0.50 per verified email** for
+the period, and it reads the **`prospect_verified_ledger`** view — every
+verified prospect, live *or* trashed, keyed on `enriched_at`:
+
+```sql
+select …, false as trashed from prospects       where verified
+union all
+select …, true  as trashed from prospects_trash where verified
+```
+
+The view is `security_invoker`, so RLS on both tables still applies to whoever
+asks. The tile counts ledger rows with `enriched_at` in the period; the
+statement lists them at $0.50 each (trashed ones marked "deleted since — still
+billed") alongside the period's misses — enriched but not verified — at "—", so
+the hit rate is visible and never charged.
+
+<Note>
+  `enriched_at` holds the *last* enrichment, not a log, so re-enriching the
+  same prospect inside a cycle bills once. That under-counts rather than
+  over-charges. Full meter rules: [Billing meters → Enrichment](/conventions/billing-meters#enrichment).
+</Note>
+
+## Where things are
+
+| Piece | Path |
+| --- | --- |
+| Prospects screen (both modes + sheet) | `components/marketing-prospects/marketing-prospects-view.tsx` |
+| Research screen | `components/marketing-prospects/research-view.tsx` |
+| Enrich candidate search | `app/api/marketing-prospects/enrich/route.ts` |
+| Per-row enrich (Exa + Apollo) | `app/api/marketing-prospects/[id]/enrich/route.ts` |
+| Research board / ask | `app/api/marketing-prospects/research/route.ts`, `…/research/ask/route.ts` |
+| Photo store + Exa helpers | `lib/marketing-prospects/enrich.ts` |
+| Meter + statement | `app/admin/billing/meters-data.ts`, `app/admin/billing/statement-data.ts` |
+| Schema | `supabase/migrations/0034_prospects.sql`, `0076`–`0079` |

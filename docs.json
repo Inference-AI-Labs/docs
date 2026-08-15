@@ -22,7 +22,8 @@
         "pages": [
           "conventions/posthog",
           "conventions/workflow-codes",
-          "conventions/billing-meters"
+          "conventions/billing-meters",
+          "conventions/marketing-prospects"
         ]
       },
       {

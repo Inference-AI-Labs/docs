@@ -43,7 +43,7 @@ either drop the last instant of the month or double-count it into the next.
 | **MCP calls** | Assistant tool calls | PostHog `mcp_request` |
 | **Messaging** | WhatsApp messages | Kapso |
 | **Workflows** | Automations running on the account | things, via `GET /workflows` |
-| **Enrichment** | Verified contacts | the app's own `prospects` table |
+| **Enrichment** | Verified emails | the app's own `prospects` + `prospects_trash` (via `prospect_verified_ledger`) |
 
 ### Intelligence
 
@@ -145,14 +145,19 @@ and the statement says why when opened.
 
 ### Enrichment
 
-Prospects with `verified = true` and `enriched_at` inside the period, billed at
-**$0.50 per verified contact**.
+Verified emails with `enriched_at` inside the period, billed at **$0.50 per
+verified email**. Read from the `prospect_verified_ledger` view — every
+`verified = true` prospect, live **or in `prospects_trash`** — so deleting a
+verified prospect after the fact doesn't shrink the bill. How the flag, the
+trash and the ledger fit together is on
+[Marketing Prospects](/conventions/marketing-prospects).
 
 An enrichment that came back without a deliverable address **isn't charged** —
 it cost us the lookup but gave you nothing to use — so counting every enrichment
-would put a number on the tile that the statement then contradicts. A prospect
-stores only its most recent enrichment, so re-enriching the same one within a
-cycle bills once, not twice.
+would put a number on the tile that the statement then contradicts. The
+statement still lists those misses at "—" so the hit rate is visible. A
+prospect stores only its most recent enrichment, so re-enriching the same one
+within a cycle bills once, not twice.
 
 ## Statements: two stages
 
