@@ -5,7 +5,10 @@ description: The Cloudflare Workers behind *.takeflow.io — one account, all te
 ---
 
 Flow's backend edge runs on a small set of **Cloudflare Workers**, all in one
-account (`07f6a2e9…ae62f`) and one monorepo at `~/Documents/inference/workers`.
+account (`07f6a2e9…ae62f`) and one monorepo —
+[`Inference-AI-Labs/workers`](https://github.com/Inference-AI-Labs/workers),
+cloned at `~/Documents/takeflow/workers` (one folder per worker, consolidated
+2026-08-19).
 Each worker owns a subdomain of `takeflow.io` and, like the rest of Flow, is
 **multi-tenant** — a single deployment serves every client, kept apart by a
 tenant identifier carried in the request (an API key, a path token, or a URL
@@ -44,9 +47,10 @@ segment).
 </CardGroup>
 
 <Note>
-  **billing** is shared and tenant-based like the rest, but its source lives in
-  the `things` repo (`~/Documents/takeflow/things/workers/billing`) rather than
-  the workers monorepo — it is deployed from there.
+  The monorepo also carries the per-client and one-off workers (quote decks,
+  menus, backups, proposals) beside the shared fleet. Its `README.md` is the
+  index: folder → worker name → origin. `billing` moved in from the `things`
+  repo on 2026-08-19; the copy left under `things/workers/billing` is stale.
 </Note>
 
 ## Per-client workers
@@ -101,12 +105,15 @@ config (and secrets) from a bundled file:
 Each worker is an independent wrangler project. From its directory:
 
 ```bash
-cd ~/Documents/inference/workers/<worker>
-wrangler deploy
+cd ~/Documents/takeflow/workers/<worker>
+npx wrangler deploy
 
 # secrets (per tenant, by the name its config references)
 wrangler secret put CLIENT_CARMATE_SERVICE_KEY
 ```
 
-The root `takeflow` worker deploys from the monorepo root itself
-(`~/Documents/inference/workers`, `wrangler.toml`).
+`node_modules/` is not committed — `npm i` in the worker's folder first. The
+`takeflow` worker (`workflow.takeflow.io`) lives at `workers/takeflow/`
+(`wrangler.toml`, KV `FLOWS`); as of 2026-08-20 it is **not deployed** — the
+hostname doesn't resolve and the script isn't in the account — so redeploy
+from there before relying on the `/flow` skill.

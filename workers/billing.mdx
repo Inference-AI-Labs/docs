@@ -12,7 +12,11 @@ It runs at `billing.takeflow.io` and nowhere else — `workers_dev` and
 `preview_urls` are both `false` in `wrangler.jsonc`, because the same money
 endpoints on an unwatched hostname is the whole risk.
 
-Source lives at `~/Documents/takeflow/things/workers/billing`.
+Source lives in the workers monorepo —
+[`Inference-AI-Labs/workers`](https://github.com/Inference-AI-Labs/workers),
+`billing/` (local clone `~/Documents/takeflow/workers/billing`). That is the
+canonical copy since 2026-08-19; the older tree under
+`things/workers/billing` is a stale duplicate — don't edit or deploy from it.
 
 <Warning>
   The worker was uploaded straight to Cloudflare on 2026-07-14 and its source
@@ -30,6 +34,7 @@ The split that explains the whole design:
 | --- | --- | --- |
 | **D1** (`billing` database, binding `DB`) | Money — what was paid, what is owed, the meter snapshot | the worker's own binding |
 | **things** (central Supabase) | Identity — who the client is, their package, add-ons, workflows, contacts | PostgREST with `THINGS_SERVICE_KEY` |
+| **D1** (`payment_intent` database, binding `PAYMENT_INTENT`) | Telemetry — every client interaction with the billing page, and who did it. See [the payment_intent log](#the-payment_intent-log) | the worker's own binding |
 
 A tenant therefore has a row in *both*, keyed differently: D1 by `tenants.id`
 with an `api_key`, things by `tenants.supabase_ref` with a `signing_secret`.
@@ -39,7 +44,7 @@ with an `api_key`, things by `tenants.supabase_ref` with a `signing_secret`.
 | Auth | Routes | Who calls it |
 | --- | --- | --- |
 | **Bearer** — `tenants.api_key` from D1 | `GET /balance`, `GET /payments`, `POST /checkout` | client usage pages (dmn, picotin) |
-| **Signed** — HMAC keyed by `tenants.signing_secret` in things | `GET /workflows`, `GET /plan`, `POST /switch-annual`, `POST /email-invoice` | client billing pages (sujaskitchen) |
+| **Signed** — HMAC keyed by `tenants.signing_secret` in things | `GET /workflows`, `GET /plan`, `POST /start-subscription`, `POST /switch-annual`, `POST /tax-id`, `POST /email-invoice`, `POST /invoice-item`, `POST /notify` | client billing pages (tflc, picotin, al-rumooz, cfs, sujaskitchen, expeed) |
 | **Admin** — `ADMIN_KEY` bearer | `GET/POST /admin/tenants` | operators |
 | **Stripe** — webhook signature | `POST /stripe` | Stripe |
 
@@ -69,6 +74,13 @@ const sig = crypto
 
 The tenant ref is **derived, not configured** — it's the project ref parsed out
 of `NEXT_PUBLIC_SUPABASE_URL`, so an app can only ever sign as itself.
+
+The same file also sends a fourth, optional header, `x-actor-email` — the
+logged-in user's email from `supabase.auth.getUser()`, best-effort (no session
+or a Supabase hiccup simply sends none). It is **not** part of the signed
+string: it feeds the [payment_intent log](#the-payment_intent-log), which is
+telemetry, not authorization — only a caller that already holds the signing
+secret gets far enough for it to be read.
 
 <Note>
   A signed request with an unknown ref and one whose tenant has no
@@ -191,6 +203,72 @@ says monthly. If the write-back fails, the payment is still recorded and an
 generated `tk_…` API key on create or rotate. `GET` lists tenants with payment
 count and collected cents.
 
+## The payment_intent log
+
+A second D1, `payment_intent` (binding `PAYMENT_INTENT`, id `5c5b1e7a-…`),
+answers a different question from the ledger: **what did the client do on the
+billing page, and who did it?** Every client-facing route writes one row to
+`events` after it has answered — a page open, an upgrade, an annual switch,
+a tax-id, an invoice email, a checkout — with the HTTP status the worker
+returned, so a failed upgrade is as visible as a successful one.
+
+It is deliberately a separate database: telemetry writes can never contend
+with, lock, or bloat the money tables.
+
+| `event` | Route | `detail` (JSON) |
+| --- | --- | --- |
+| `visit` | `GET /plan`, `GET /workflows` — the page open | — |
+| `start_subscription` | `POST /start-subscription` | `package`, `subscription_cents`, `taxId` (bool) |
+| `switch_annual` | `POST /switch-annual` | `package`, `from: monthly`, `to: annual` |
+| `tax_id` / `email_invoice` / `invoice_item` | the matching `POST` | — |
+| `checkout` / `balance` / `payments` | the bearer-key trio | — |
+
+Each row: `tenant_id`, `tenant_ref`, `tenant_name`, **`actor_email`**,
+`event`, `path`, `method`, `status`, `ok` (1 on 2xx), `detail`, `country`
+(`cf.country` of the calling app server), `created_at`. Indexed by tenant,
+event, actor and time.
+
+`actor_email` is whatever the client app sent in `x-actor-email` (see the
+signed-request contract above). It is null for bearer-key clients and for app
+builds that predate the header; the tenant's own billing emails are *not*
+copied in — they are one join away on `tenant_id`, and duplicating them would
+be one more place holding PII.
+
+How it's wired, in `src/index.ts`:
+
+```ts src/index.ts
+const intentLog = createMiddleware(async (c, next) => {
+  await next();                      // answer first
+  const tenantId = c.get("things")?.id ?? c.get("tenant")?.id;
+  if (!tenantId) return;             // unauthenticated attempts are not client interactions
+  const write = c.env.PAYMENT_INTENT.prepare(`INSERT INTO events (…) VALUES (…)`)
+    .bind(/* … */).run()
+    .catch((err) => console.error("payment_intent write failed", err));
+  c.executionCtx.waitUntil(write);   // after the response; a failed write is swallowed
+});
+for (const path of Object.keys(EVENT_BY_PATH)) app.use(path, intentLog);
+```
+
+The write runs in `waitUntil` **after** the response and swallows its own
+errors — the log must never be able to slow down or break money. Routes that
+know something worth keeping (`/start-subscription`, `/switch-annual`) set
+`c.set("intentDetail", JSON.stringify({...}))` before returning.
+
+Schema lives in `migrations/payment_intent/` (`0001`–`0003`). Apply and query:
+
+```bash
+npx wrangler d1 migrations apply payment_intent --remote
+npx wrangler d1 execute payment_intent --remote --json \
+  --command "SELECT tenant_name, actor_email, event, status, created_at FROM events ORDER BY id DESC LIMIT 20"
+```
+
+<Note>
+  Client apps only start sending `x-actor-email` once they're deployed from a
+  build that has it — `signed-fetch.ts` in tflc, picotin, al-rumooz, cfs,
+  sujaskitchen and expeed gained it on 2026-08-19. Until then their `visit`
+  rows land with `actor_email = null`.
+</Note>
+
 ## Secrets
 
 ```bash
@@ -199,30 +277,27 @@ wrangler secret put STRIPE_SECRET_KEY     --name billing
 wrangler secret put STRIPE_WEBHOOK_SECRET --name billing
 wrangler secret put THINGS_URL            --name billing   # https://<ref>.supabase.co
 wrangler secret put THINGS_SERVICE_KEY    --name billing
+wrangler secret put SLACK_WEBHOOK_URL     --name billing   # optional — alerts
 ```
 
 For local dev put the same **names** in `.dev.vars` (gitignored). Reference
 names only — never values.
 
-<Warning>
-  **`STRIPE_WEBHOOK_SECRET` has never been set.** Verified against
-  `wrangler secret list --name billing` on 2026-08-10: only `ADMIN_KEY`,
-  `STRIPE_SECRET_KEY`, `THINGS_URL` and `THINGS_SERVICE_KEY` exist. Every
-  `POST /stripe` therefore fails signature verification with a zero-length HMAC
-  key, so **no payment has ever been recorded** — `payments` has had zero rows
-  since 2026-07-14. Set the secret, then replay the failed events from the
-  Stripe dashboard.
-
-  Note what this does and does not break: `/plan` reads invoices from Stripe
-  live, so a client's billing page still shows their real invoices. It is the D1
-  ledger — balances, settlement snapshots — that is empty.
-</Warning>
+<Note>
+  `STRIPE_WEBHOOK_SECRET` was missing from 2026-07-14 until **2026-08-14**, so
+  every `POST /stripe` in that window failed signature verification and the D1
+  ledger stayed empty (the client's billing page was unaffected — `/plan` reads
+  invoices from Stripe live). It is set now and proven on real money the same
+  day: the webhook wrote `stripe_customer_id` back, auto-enrolled the D1 tenant
+  row, and recorded the payment once.
+</Note>
 
 ## Deploying
 
 ```bash
-cd ~/Documents/takeflow/things/workers/billing
-wrangler deploy
+cd ~/Documents/takeflow/workers/billing
+npm i && npx tsc --noEmit
+npx wrangler deploy
 ```
 
 ## See also
