@@ -168,6 +168,78 @@ Other checks:
   `https://<ref>.supabase.co/auth/v1/authorize?provider=azure` should redirect
   to `login.microsoftonline.com/common/…` with `client_id=15161a71…`.
 
+## When a login fails
+
+Work backwards along the path: Microsoft → Supabase → the app's callback. The
+error text says which leg broke.
+
+| What the person sees | Where it broke | Cause |
+| --- | --- | --- |
+| The address bar shows the Supabase host twice, e.g. `…supabase.cohttps//…supabase.co` | Before Microsoft | `NEXT_PUBLIC_SUPABASE_URL` holds its value twice. See below. |
+| `AADSTS50020: User account … does not exist in tenant '<other client>'` | Microsoft | The Supabase provider's **Azure Tenant URL** points at another client's tenant. Set it to `common`. |
+| `AADSTS650051: … service principal name is already present` | Microsoft | Transient, on the first-ever login from that organisation. Microsoft sets the app up mid-request and reports an error doing it. **Retry once**; the second attempt goes through. |
+| `AADSTS50011: redirect URI mismatch` | Microsoft | `https://<ref>.supabase.co/auth/v1/callback` is missing from the `flow` app's redirect URIs. |
+| `Invalid API key` | The app's callback | The app's Supabase publishable key is wrong, so `exchangeCodeForSession` is rejected before it reaches the auth server. |
+| `This account isn't allowed to sign in.` | The app's callback | The account's domain is not in `ALLOWED_DOMAINS`. On a forked app this is usually still the previous client's domain. |
+
+<Note>
+  The last two happen **after** Microsoft and Supabase have both succeeded, so
+  the Microsoft side can look perfect while every login still fails.
+</Note>
+
+### Read the logs
+
+Supabase's auth logs show how far each attempt got. `/authorize` without a
+matching `/callback` means Microsoft rejected it; the `/callback` line carries
+the `AADSTS…` text.
+
+```bash
+curl -s -G -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/<ref>/analytics/endpoints/logs.all" \
+  --data-urlencode "sql=select timestamp, event_message from auth_logs order by timestamp desc limit 40" \
+  --data-urlencode "iso_timestamp_start=2026-09-22T15:40:00Z" \
+  --data-urlencode "iso_timestamp_end=2026-09-22T16:00:00Z"
+```
+
+Then `vercel logs <deployment>` for the app's own leg. A `307` on
+`/auth/callback` back to `/` is the callback bouncing the login.
+
+The user table tells you the same story:
+
+```sql
+select email, created_at, last_sign_in_at from auth.users order by created_at desc;
+```
+
+- **A row with `last_sign_in_at` null** — Microsoft and Supabase finished, the app's callback then failed. Look at the app, not Microsoft.
+- **No row at all, after a real attempt** — the domain check rejected it and deleted the user, exactly as `app/auth/callback/route.ts` intends.
+
+### Env values pasted twice
+
+Setting many Vercel vars in one go can store each value **doubled** — the URL,
+the keys, everything. A doubled key gives `Invalid API key`; a doubled URL
+gives the malformed address above.
+
+Sensitive vars can't be read back (`vercel env pull` returns them empty), so
+check the ones the browser receives by pulling them out of the live bundle and
+comparing **lengths** against `.env.local`:
+
+```bash
+for js in $(curl -s "https://<app>.takeflow.io/" | grep -o '/_next/static/[^"]*\.js' | sort -u); do
+  curl -s "https://<app>.takeflow.io$js" | grep -oE 'sb_publishable_[A-Za-z0-9_-]+|phc_[A-Za-z0-9]+'
+done | sort -u | while read k; do echo "${k:0:20}… len ${#k}"; done
+```
+
+A publishable key is 46 characters; 92 means it was stored twice. Confirm a key
+is live and valid with `curl -o /dev/null -w '%{http_code}' https://<ref>.supabase.co/auth/v1/settings -H "apikey: <key>"` — 200 good, 401 bad.
+
+<Warning>
+  Server-only values can't be checked this way at all. Verify
+  `MICROSOFT_CLIENT_SECRET` by asking Microsoft for a `client_credentials`
+  token with it before you trust it, and re-set anything you can't verify.
+  Vercel only picks up new values on the **next deploy**, so redeploy before
+  re-testing — otherwise you'll debug the old value.
+</Warning>
+
 ## Localhost fallback
 
 Production is Microsoft-only. For local development, `/login/fall` offers
