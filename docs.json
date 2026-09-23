@@ -23,7 +23,8 @@
           "conventions/posthog",
           "conventions/workflow-codes",
           "conventions/billing-meters",
-          "conventions/marketing-prospects"
+          "conventions/marketing-prospects",
+          "conventions/microsoft-login"
         ]
       },
       {

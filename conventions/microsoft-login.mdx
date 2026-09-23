@@ -1,0 +1,175 @@
+---
+title: Microsoft login for a client app
+sidebarTitle: Microsoft login
+description: How to wire "Sign in with Microsoft" for a new Flow tenant using the shared multi-tenant "flow" Azure app, Supabase's Azure provider, and a per-app domain check.
+---
+
+## One Azure app, many tenants
+
+Every Flow app signs in through a **single multi-tenant Azure app registration**
+called `flow`. We do **not** register an app per client. Each tenant is kept
+apart by two things: its own Supabase project and an email-domain check in its
+own code.
+
+| Setting | Value |
+| --- | --- |
+| App name | `flow` |
+| Client ID | `15161a71-35f9-4dc9-8d95-0c3ab8350272` |
+| Home directory | `kinference.onmicrosoft.com` (tenant `1ad867c7-…`) |
+| Sign-in audience | `AzureADMultipleOrgs`, so any organisation's work accounts |
+| Secret | one secret, hint `Hl0…`, expires **2028-05-21** |
+
+Microsoft is used in two places, and each reads the keys from somewhere different:
+
+| Path | What it does | Reads keys from | Callback |
+| --- | --- | --- | --- |
+| **Sign-in** | Staff sign in to the app | The Supabase project's **Azure provider** (dashboard → Authentication → Providers → Azure) | `https://<ref>.supabase.co/auth/v1/callback` |
+| **Mailbox (Graph)** | Refreshes the Graph tokens saved at sign-in, and runs the Talents connector | The app's **env vars**: `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` and `MICROSOFT_TENANT_ID` | `https://<app>.takeflow.io/api/talents/microsoft/callback` |
+
+Both paths use the same client ID and secret. If either side is missing,
+that path breaks and the other one keeps working, so a half-configured
+tenant can look fine at first.
+
+## The tenant setting
+
+The tenant only decides **which organisations Microsoft will offer a login
+for**. It does not decide who gets into the app.
+
+- **`common`**: any organisation. This is the default for client apps.
+- **A tenant ID**: that one organisation only. Use it only when the client explicitly wants it.
+
+Who actually gets in is decided by `ALLOWED_DOMAINS` in
+`app/auth/callback/route.ts`. With `common`, **that check is the only gate**.
+A disallowed account can finish the Microsoft login, so the callback signs it
+out and deletes the Supabase user it just created.
+
+## Setting up a new tenant
+
+<Steps>
+  <Step title="Find the client's real Microsoft domain">
+    Check that the domain the client's staff sign in with is on Microsoft 365:
+
+    ```bash
+    curl -s "https://login.microsoftonline.com/getuserrealm.srf?login=x@<domain>&json=1"
+    ```
+
+    You want `"NameSpaceType":"Managed"` (or `"Federated"`). `"Unknown"` means
+    that domain is not on Microsoft, so staff can't sign in with it. Ask the
+    client which domain they actually use.
+  </Step>
+
+  <Step title="Register the Supabase callback on the flow app">
+    Add `https://<ref>.supabase.co/auth/v1/callback` to the app's web redirect
+    URIs. `az ad app update --web-redirect-uris` **replaces** the whole list
+    (and it rejects some lists outright), so patch it through Graph with the
+    existing list plus the new entry:
+
+    ```bash
+    APP=15161a71-35f9-4dc9-8d95-0c3ab8350272
+    OID=$(az ad app show --id $APP --query id -o tsv)
+    az ad app show --id $APP --query "web.redirectUris" -o json \
+      | python3 -c "import json,sys;u=json.load(sys.stdin);u.append('https://<ref>.supabase.co/auth/v1/callback');print(json.dumps({'web':{'redirectUris':u}}))" \
+      > patch.json
+    az rest --method PATCH --url "https://graph.microsoft.com/v1.0/applications/$OID" \
+      --headers Content-Type=application/json --body @patch.json
+    ```
+
+    Add `https://<app>.takeflow.io/api/talents/microsoft/callback` the same way
+    if the app uses the Talents mailbox connector.
+  </Step>
+
+  <Step title="Configure the Supabase Azure provider">
+    On the tenant's Supabase project (**Authentication → Providers → Azure**):
+
+    | Field | Value |
+    | --- | --- |
+    | Enabled | on |
+    | Client ID | `15161a71-35f9-4dc9-8d95-0c3ab8350272` |
+    | Secret | the `flow` app's secret, the same value as `MICROSOFT_CLIENT_SECRET` |
+    | Azure Tenant URL | `https://login.microsoftonline.com/common` |
+
+    Then under **Authentication → URL Configuration**, set **Site URL** to
+    `https://<app>.takeflow.io` and add these to **Redirect URLs**:
+    `https://<app>.takeflow.io/**` and `http://localhost:3000/**`.
+
+    <Warning>
+      With an empty Redirect URLs list, Supabase can ignore the app's
+      `redirectTo` (`/auth/callback?next=…`) and fall back to the Site URL. The
+      code never reaches `/auth/callback`, so the domain check never runs and
+      the Graph tokens are never saved.
+    </Warning>
+  </Step>
+
+  <Step title="Set the app's env vars">
+    Add the three vars to `.env.local` and to Vercel production:
+
+    ```bash
+    printf '15161a71-35f9-4dc9-8d95-0c3ab8350272' | vercel env add MICROSOFT_CLIENT_ID production
+    printf '<secret>' | vercel env add MICROSOFT_CLIENT_SECRET production --sensitive
+    printf 'common' | vercel env add MICROSOFT_TENANT_ID production
+    ```
+
+    `MICROSOFT_REDIRECT_URI` is optional. Without it, the app uses
+    `<origin>/api/talents/microsoft/callback`. Env var changes only take effect
+    on the next deploy.
+  </Step>
+
+  <Step title="Set the domain check">
+    In `app/auth/callback/route.ts`:
+
+    ```ts app/auth/callback/route.ts
+    const ALLOWED_DOMAINS = ["<client-domain>"];
+    ```
+
+    Also update any other place that decides who counts as staff, such as the
+    task roster's `INTERNAL_DOMAIN` in `components/tasks/tasks-view.tsx`.
+  </Step>
+
+  <Step title="Deploy and test one real login">
+    Push to `main`, then sign in once with a real client account. The first
+    user may see a Microsoft consent screen for `flow`. If the client's IT
+    doesn't let users approve apps themselves, one of their admins has to
+    approve it once for the whole organisation.
+  </Step>
+</Steps>
+
+<Warning>
+  When you fork a Flow app from another client, **re-check every step above**.
+  Forks carry over the other client's tenant URL on the Supabase provider, its
+  `ALLOWED_DOMAINS`, and staff addresses rewritten with a find-and-replace on
+  the domain. Fluitron shipped locked to TFLC's tenant and allowing
+  `fluitron.ae`, a domain with no Microsoft account behind it. The real
+  domain was `fluitron.com`.
+</Warning>
+
+## Verifying a tenant's config
+
+Supabase never returns the Azure secret in plain text. `GET /v1/projects/<ref>/config/auth`
+returns `external_azure_secret` as **HMAC-SHA256(key = project ref, message = secret)**.
+To check it against the known secret without exposing it:
+
+```python verify_secret.py
+import hmac, hashlib
+ok = hmac.new(ref.encode(), secret.encode(), hashlib.sha256).hexdigest() == stored
+```
+
+<Note>
+  Compare that hex value directly. Hashing it again gives a false "mismatch",
+  and that exact mistake has happened before.
+</Note>
+
+Other checks:
+
+- **Is the secret still valid?** Request a `client_credentials` token from the
+  `kinference` tenant with it. A token back means yes.
+- **Which tenant is a URL pointing at?** Look it up with
+  `az rest --url "https://graph.microsoft.com/v1.0/tenantRelationships/findTenantInformationByTenantId(tenantId='<id>')"`.
+- **Does the login start correctly?** Opening
+  `https://<ref>.supabase.co/auth/v1/authorize?provider=azure` should redirect
+  to `login.microsoftonline.com/common/…` with `client_id=15161a71…`.
+
+## Localhost fallback
+
+Production is Microsoft-only. For local development, `/login/fall` offers
+email + password sign-in that **refuses any non-localhost host**. It exists so
+that an admin outside the client's domain can still get in.
