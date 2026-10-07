@@ -23,15 +23,25 @@ inside the `devSignIn` action, because server actions are public endpoints.
 | Not a deploy | no `VERCEL` variable |
 | Opt-in key | `DEV_ACCESS_KEY` is at least 32 characters |
 | Credentials | `DEV_LOGIN_EMAIL` and `DEV_LOGIN_PASSWORD` are both set |
-| Host | the `Host` header is `localhost`, `127.0.0.1` or `[::1]`, with any port |
+| Listening address | the dev script is `next dev -H 127.0.0.1`, so the dev server is unreachable from the network |
+| Host | the `Host` header is `localhost`, `127.0.0.1` or `[::1]`, with any port (second layer only) |
+
+<Warning>
+  A client sets the `Host` header itself, so on its own it proves nothing. Plain
+  `next dev` listens on **every interface** (its banner prints a `Network:` URL),
+  which means anyone on the same network could send `Host: localhost` and be
+  signed in as the dev user. The `-H 127.0.0.1` bind is what actually closes
+  that: the server refuses connections from any other address. If you ever run
+  the dev server on `0.0.0.0` (for example to test on a phone), leave
+  `DEV_LOGIN_EMAIL` and `DEV_LOGIN_PASSWORD` empty first.
+</Warning>
 
 <Note>
-  The key is the **opt-in switch**, not a password the browser presents. The
-  protection that actually matters is development-only plus localhost-only. A
-  stray `DEV_LOGIN_PASSWORD` without the key enables nothing.
+  The key is the **opt-in switch**, not a password the browser presents. A stray
+  `DEV_LOGIN_PASSWORD` without the key enables nothing.
 </Note>
 
-On any other host the page is the normal sign-in form, even in development.
+On a request with any other `Host`, the page is the normal sign-in form, even in development.
 
 ## Env vars
 
