@@ -24,7 +24,9 @@
           "conventions/workflow-codes",
           "conventions/billing-meters",
           "conventions/marketing-prospects",
-          "conventions/microsoft-login"
+          "conventions/microsoft-login",
+          "conventions/passkeys",
+          "conventions/dev-access"
         ]
       },
       {

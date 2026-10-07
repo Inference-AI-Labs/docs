@@ -1,0 +1,149 @@
+---
+title: Developer access on localhost
+sidebarTitle: Developer access
+description: How a client app's sign-in page logs a developer straight in on localhost from a key in .env.local, the guards that keep it off everywhere else, and how to set up and rotate the dev user's password.
+---
+
+## What it does
+
+On **localhost only**, with a key in `.env.local`, the sign-in page skips the
+form. It shows **Developer access detected**, then **Logging in…**, and signs in
+as the dev user. This replaces typing a password on every local run, which
+matters because passkeys can't work on localhost (see
+[Passkeys](/conventions/passkeys)).
+
+## Guards
+
+All of these must hold. They are checked **on the server**, and checked again
+inside the `devSignIn` action, because server actions are public endpoints.
+
+| Guard | Requirement |
+| --- | --- |
+| Environment | `NODE_ENV` is `development` |
+| Not a deploy | no `VERCEL` variable |
+| Opt-in key | `DEV_ACCESS_KEY` is at least 32 characters |
+| Credentials | `DEV_LOGIN_EMAIL` and `DEV_LOGIN_PASSWORD` are both set |
+| Host | the `Host` header is `localhost`, `127.0.0.1` or `[::1]`, with any port |
+
+<Note>
+  The key is the **opt-in switch**, not a password the browser presents. The
+  protection that actually matters is development-only plus localhost-only. A
+  stray `DEV_LOGIN_PASSWORD` without the key enables nothing.
+</Note>
+
+On any other host the page is the normal sign-in form, even in development.
+
+## Env vars
+
+Set these in `.env.local`, which is gitignored. Names only here, never values.
+
+| Var | What it is |
+| --- | --- |
+| `DEV_ACCESS_KEY` | a long random string, e.g. `openssl rand -hex 48` (96 characters) |
+| `DEV_LOGIN_EMAIL` | the dev user's email |
+| `DEV_LOGIN_PASSWORD` | that user's password |
+
+Leave `DEV_LOGIN_EMAIL` and `DEV_LOGIN_PASSWORD` empty and developer access
+stays off, so the key can sit in the file harmlessly until you're ready.
+
+<Warning>
+  `DEV_LOGIN_PASSWORD` is plain text on disk. Use a **dedicated dev user**, ideally
+  not an admin, rather than a real client login.
+</Warning>
+
+## The three states
+
+`devAccessState()` in `lib/auth/dev-access.ts` returns one of:
+
+| State | Meaning | The page |
+| --- | --- | --- |
+| `off` | not available here | the normal form |
+| `auto` | available | the "detected" panel, then signs in after about 0.9s |
+| `paused` | available, but you just signed out | the normal form plus a small **Use developer access** link |
+
+**Why `paused` exists:** without it, signing out sends you to the sign-in page,
+which would sign you straight back in. `signOut` sets a `dev_access_paused`
+cookie in development, and `devSignIn` clears it on success.
+
+That cookie is deliberately **not httpOnly**. The page also checks it in the
+browser, because Next can hand back a preserved copy of the page whose server
+prop is stale (see
+[hidden pages keep their state](/conventions/passkeys#hidden-pages-keep-their-state)).
+
+If the automatic attempt fails, the error shows, the form comes back, and the
+**Use developer access** link lets you retry.
+
+## Where the pieces are
+
+| File | Role |
+| --- | --- |
+| `lib/auth/dev-access.ts` | the guards and `devAccessState()` |
+| `lib/auth/dev-cookie.ts` | the cookie name, in its own file so the client can import it |
+| `app/page.tsx` | reads the state behind a `<Suspense>` and passes it to the page |
+| `app/auth/actions.ts` | `devSignIn(next)`, and `signOut` setting the pause cookie |
+| `components/login/dev-access-panel.tsx` | the status panel |
+
+`devAccessState()` returns `"off"` **before** it reads any request data, so in
+production the sign-in page still renders as a static shell.
+
+## Setting up the dev user
+
+<Steps>
+  <Step title="Check the user exists in the project">
+    Use a read-only query on the client's Supabase project:
+
+    ```sql
+    select u.id, u.email, u.last_sign_in_at,
+           u.email_confirmed_at is not null as confirmed,
+           u.banned_until, p.role
+    from auth.users u
+    left join public.profiles p on p.id = u.id
+    where lower(u.email) = '<email>';
+    ```
+
+    You want a row that is confirmed and not banned.
+  </Step>
+
+  <Step title="Set a long random password">
+    Reset it through the **admin API** rather than editing `auth.users`. The order
+    below means a failure never locks you out:
+
+    1. Generate the password locally and write it to `.env.local` **first**.
+    2. Apply it with `auth.admin.updateUserById`.
+    3. Prove it works by signing in with the publishable key.
+
+    ```js set-password.mjs
+    const admin = createClient(url, process.env.SUPABASE_SECRET_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { error } = await admin.auth.admin.updateUserById(userId, { password });
+    if (error) throw error;
+
+    const anon = createClient(url, process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { error: verifyError } = await anon.auth.signInWithPassword({ email, password });
+    ```
+
+    Run it with `node --env-file=.env.local script.mjs`, from a scratch folder,
+    and **never print the password**. Delete the script afterwards.
+  </Step>
+
+  <Step title="Reload and check">
+    `next dev` reloads `.env.local` on save. Open `http://localhost:3000` and you
+    should see the detected panel. A request with a different `Host` header should
+    not.
+  </Step>
+</Steps>
+
+<Warning>
+  Resetting a password **ends the old one everywhere**, including on the
+  production sign-in page. Existing sessions are not revoked. If it's your own
+  admin account, add a passkey on the deployed domain afterwards so you aren't
+  relying on a password only `.env.local` knows.
+</Warning>
+
+## Rotating it
+
+Rerun step 2. To switch developer access off, empty `DEV_LOGIN_EMAIL` and
+`DEV_LOGIN_PASSWORD`.

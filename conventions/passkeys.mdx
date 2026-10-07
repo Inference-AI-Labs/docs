@@ -1,0 +1,220 @@
+---
+title: Passkeys and the sign-in page for a client app
+sidebarTitle: Passkeys
+description: How to roll passkeys (WebAuthn) and the redesigned sign-in page out to a client app, using things as the reference and cfs as the first port. Covers the per-app RP ID, the Supabase settings, the config-push trap, the page's transitions, and the Next 16 hidden-page state gotcha.
+---
+
+## One RP ID per app
+
+A passkey is bound to its **relying-party ID** (`rp_id`) permanently. Change it
+and every enrolled passkey stops working, with no migration path. The ID must
+also be a suffix of the domain the page is served from.
+
+Each client app has its **own Supabase project** and its own domain, so each
+gets its own RP ID. A passkey enrolled on one app does not work on another.
+
+| App | `rp_id` | Allowed origin |
+| --- | --- | --- |
+| things | `things.takeflow.io` | `https://things.takeflow.io` |
+| cfs | `cfs.takeflow.io` | `https://cfs.takeflow.io` |
+| a new client | `<app>.takeflow.io` | `https://<app>.takeflow.io` |
+
+Two consequences:
+
+- **You can't exercise passkeys on localhost** against a live project. Test
+  them on the deployed domain.
+- **Don't widen `rp_id` to `takeflow.io`** to share one passkey across clients.
+  It only works inside a single Supabase project, and every client has their
+  own. It would also invalidate every passkey already enrolled.
+
+## Porting passkeys to a client app
+
+things is the reference. cfs was the first port.
+
+<Steps>
+  <Step title="Check the live project first">
+    In the client's Supabase dashboard, open **Authentication → Passkeys**.
+    cfs already had it enabled with the right RP ID. Read what's there before
+    you change anything.
+
+    If it's off, turn it on and set:
+
+    | Field | Value |
+    | --- | --- |
+    | Display name | the client's name; this is what the OS passkey prompt shows |
+    | RP ID | `<app>.takeflow.io` |
+    | Allowed origin | `https://<app>.takeflow.io` |
+
+    `supabase/config.toml` (`[auth.passkey]`, `[auth.webauthn]`) only
+    **records** these values for local development. The hosted project ignores
+    the file. Keep the display name in the file identical to the live one.
+  </Step>
+
+  <Step title="Copy the code from things">
+    | File | What it does |
+    | --- | --- |
+    | `lib/auth/passkeys.ts` | `usePasskeysSupported()`, `passkeyErrorMessage()`, and a device-name guess for new passkeys |
+    | `components/passkeys/passkeys-dialog.tsx` | list, add, rename and remove passkeys |
+    | `lib/supabase/client.ts` | the browser client opts in with `auth: { experimental: { passkey: true } }` |
+    | `components/nav-user.tsx` | a **Passkeys** item in the account menu that opens the dialog |
+    | the sign-in page | a "Use a passkey" button that calls `supabase.auth.signInWithPasskey()` |
+
+    <Warning>
+      Without `experimental: { passkey: true }` on the browser client,
+      `signInWithPasskey`, `registerPasskey` and `auth.passkey.*` **throw**
+      instead of returning an error. Keep the flag on the one factory every
+      browser caller goes through.
+    </Warning>
+
+    Adjust for the client app:
+
+    - things uses `@hugeicons-pro/...`; client apps use `@hugeicons/core-free-icons`.
+      `FingerPrintIcon`, `PencilEdit02Icon` and `Delete02Icon` exist in both.
+    - Open the dialog from the menu with `setTimeout(() => setPasskeysOpen(true), 0)`.
+      Otherwise the menu's focus restore lands after the dialog mounts and
+      closes it again.
+    - A dismissed OS sheet and "no matching credential" are the same error
+      (`NotAllowedError`). `passkeyErrorMessage()` returns `null` for both so
+      the page stays silent. Don't toast it.
+    - Client apps may use stricter React lint rules. Load the passkey list with
+      a `.then()` inside the effect instead of calling a `load()` that sets state.
+  </Step>
+
+  <Step title="Redirect safely after sign-in">
+    A passkey sign-in finishes in the browser, so the redirect is client-side.
+    Resolve `next` with the URL parser and compare origins:
+
+    ```ts components/landing-page.tsx
+    function sameOriginPath(next: string): string {
+      try {
+        const target = new URL(next, window.location.origin);
+        if (target.origin === window.location.origin) {
+          return target.pathname + target.search + target.hash;
+        }
+      } catch {}
+      return "/home";
+    }
+    ```
+
+    <Warning>
+      A prefix check (`startsWith("/")`, not `//`, not `/\`) is **not enough**.
+      `"/\t/evil.com"` passes it, and browsers strip the tab, turning it into
+      `//evil.com`. This was caught by the automated security review on the cfs
+      commit.
+    </Warning>
+
+    Use `window.location.assign`, not a router push, so the middleware reads the
+    session cookies that were just written.
+  </Step>
+
+  <Step title="Enrol and test on the deployed domain">
+    Sign in once with a password, add a passkey from the account menu, sign out,
+    then use **Use a passkey**. Passkeys don't sync unless the person's password
+    manager syncs them, so each device needs its own.
+  </Step>
+</Steps>
+
+## Don't `config push` blindly
+
+`supabase config push --project-ref <ref>` sends the **whole** `config.toml`.
+The local file is not a mirror of a live project, so a push would overwrite
+settings that differ. On cfs the preview showed:
+
+| Setting | Live | Local file |
+| --- | --- | --- |
+| `site_url` | `http://localhost:3000` | `http://127.0.0.1:3000` |
+| TOTP MFA | enabled | disabled |
+| Email confirmations | on | off |
+| OTP length | 8 | 6 |
+
+The only passkey difference was the display name. So:
+
+1. Run the push, read the diff, and **answer `n`** unless it shows only the
+   passkey keys: `echo n | supabase config push --project-ref <ref>`.
+2. Fix the passkey keys in `config.toml` so they match live, rather than
+   pushing the file.
+
+<Note>
+  An old CLI can't read the file at all. v2.34.3 (the one in `~/.supabase/bin`,
+  which comes first on the PATH) fails with `'auth' has invalid keys: passkey,
+  webauthn`. v2.98.2 from Homebrew parses them; call it as
+  `/opt/homebrew/bin/supabase`. Upgrading the Homebrew formula may ask you to
+  trust the `mongodb/brew` tap first, which is your decision to make.
+</Note>
+
+## The sign-in page
+
+The redesigned page is a centered card, shared by the apps that get it.
+
+- **Palette:** the `warm` class is pinned on the page. Signed out, no theme
+  cookie exists yet, so the root would otherwise fall back to `light`.
+- **Layers:** a `bg-muted` base, a `bg-card` sheet, `bg-muted/50` inputs. Flat,
+  square, no shadows, no decorative borders (the app's "paper on paper" rules).
+- **One primary button.** **Continue** is solid. **Use a passkey** is a flat
+  tonal button under an "or" divider, never louder than Continue.
+- **Heading** matches things: `Sign in.` at `text-5xl`, semibold, tight
+  tracking.
+
+### Transitions
+
+The page uses `framer-motion`.
+
+| Moment | Effect |
+| --- | --- |
+| Arriving | the card fades up 18px; its contents stagger in |
+| Error | the message grows and shrinks in height so the buttons glide |
+| Signing in | the card lifts 10px and the page fades out (0.3s), then it navigates |
+| Landing on the app | the shell fades in, once per visit |
+
+Rules that keep it working:
+
+- **`signIn` returns `{ redirectTo }`** instead of calling `redirect()`, so the
+  client can play the exit before navigating. The already-signed-in shortcut
+  still redirects on the server.
+- **The app fade is opacity only.** The layout is `app/(app)/layout.tsx`, wrapped
+  in `<AppEnter>`. A transform on an ancestor would become the containing block
+  for the sidebar's `position: fixed`.
+- The layout persists across navigations, so the fade plays once on arrival,
+  not on every route change.
+- Everything flattens to plain fades under `prefers-reduced-motion`.
+
+### Hidden pages keep their state
+
+<Warning>
+  With Cache Components on, Next 16 hides the page you navigate away from with
+  React's `<Activity>` instead of unmounting it. Its state and DOM survive, up
+  to three routes.
+</Warning>
+
+On the sign-in page that caused two bugs: after signing out, you landed on a
+login page still faded to nothing (`leaving` was still `true`), with the last
+password in the field. A blank screen on sign-out is this.
+
+The fix is to reset the page's state in a **`useLayoutEffect` cleanup**, which
+runs as the page is hidden, so the reset is never seen:
+
+```tsx components/landing-page.tsx
+useLayoutEffect(() => {
+  const form = formRef.current;
+  return () => {
+    setLeaving(false);
+    setPasskeyPending(false);
+    setShowPassword(false);
+    setError(null);
+    form?.reset();
+  };
+}, []);
+```
+
+See `node_modules/next/dist/docs/01-app/02-guides/preserving-ui-state.md`.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Developer access" icon="key" href="/conventions/dev-access">
+    Skip the form on localhost with a key in `.env.local`.
+  </Card>
+  <Card title="Microsoft login" icon="right-to-bracket" href="/conventions/microsoft-login">
+    The other way staff sign in to a client app.
+  </Card>
+</CardGroup>
