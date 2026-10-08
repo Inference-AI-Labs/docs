@@ -1,0 +1,183 @@
+---
+title: PostHog setup and audit protocol
+sidebarTitle: PostHog setup
+description: How to wire a client app to the shared PostHog project, push its keys to production, and audit that every tenant is healthy.
+---
+
+[PostHog usage](/conventions/posthog) explains the model: one shared project,
+one `tenant` tag per app. This page is the **protocol** — what a client app
+must contain, where each key goes, and how to audit the fleet.
+
+## The shared project
+
+| Setting | Value |
+| --- | --- |
+| Project id | `445829` |
+| Ingest host (browser + `posthog-node`) | `https://us.i.posthog.com` |
+| Query host (HogQL for billing meters) | `https://us.posthog.com` |
+| Browser token | one token, **same for every tenant** |
+| Personal API key | one key, **same for every tenant** (server-side only) |
+| Tenant separation | the `tenant` event property, not separate projects |
+
+Because the token and key are shared, onboarding a client never creates
+anything in PostHog. It copies the same values into the new app and sets a
+unique tenant tag.
+
+## What every client app contains
+
+<Steps>
+  <Step title="Dependencies">
+    `posthog-js` (browser) and `posthog-node` (server) in `package.json`.
+  </Step>
+  <Step title="instrumentation-client.ts">
+    Initialises the browser SDK and registers the tenant tag. See
+    [PostHog usage](/conventions/posthog#the-tenant-tag) for the full block.
+
+    ```ts instrumentation-client.ts
+    posthog.register({ tenant: "<tenant>" })
+    ```
+  </Step>
+  <Step title="lib/posthog-server.ts">
+    A singleton `PostHog` client built from `NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN`
+    and `NEXT_PUBLIC_POSTHOG_HOST`, with `flushAt: 1` and `flushInterval: 0` so
+    serverless invocations flush before they freeze.
+  </Step>
+  <Step title="instrumentation.ts">
+    Exports `onRequestError`, which sends uncaught server errors (route
+    handlers, server actions, RSC) to `captureException` with the same tenant
+    tag, recovering the `distinct_id` from the `ph_phc_*_posthog` cookie when
+    present.
+
+    ```ts instrumentation.ts
+    await posthog.captureException(err, distinctId, { tenant: "<tenant>" })
+    ```
+  </Step>
+</Steps>
+
+The tenant string in `instrumentation-client.ts` and `instrumentation.ts` must
+be identical. Copy all four pieces from a healthy app (carmate is the
+reference) and change only the tenant string.
+
+## Environment variables
+
+Seven variables, set in **both** `.env.local` and Vercel **production**.
+
+| Variable | Purpose | Vercel type |
+| --- | --- | --- |
+| `NEXT_PUBLIC_POSTHOG_HOST` | browser and server ingest host | plain |
+| `NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN` | shared browser token | plain |
+| `POSTHOG_PERSONAL_API_KEY` | HogQL queries for [billing meters](/conventions/billing-meters) | `--sensitive` |
+| `POSTHOG_PROJECT_ID` | `445829` | `--sensitive` |
+| `POSTHOG_QUERY_HOST` | `https://us.posthog.com` | `--sensitive` |
+| `POSTHOG_TENANT` | scopes the MCP meter to this client | `--sensitive` |
+| `POSTHOG_AI_KEY_NAME` | scopes the Intelligence meter | `--sensitive` |
+
+The first two are enough for event capture. The other five are only needed on
+apps that carry the `/admin/billing` usage meters; a flat plan with no usage
+meters can skip them.
+
+### Pushing to production
+
+Pipe values through stdin so they never appear in shell history or output. Take
+them from a healthy app's `.env.local`.
+
+```bash
+printf %s "$value" | vercel env add POSTHOG_TENANT production --sensitive \
+  --cwd <app> --scope inference-ai-labs
+```
+
+Drop `--sensitive` for the two `NEXT_PUBLIC_*` variables. Never `echo`, `cat` or
+log a value while doing this.
+
+<Warning>
+  `NEXT_PUBLIC_*` values are inlined at build time. Adding them to Vercel does
+  nothing for a running deployment — **redeploy** before expecting browser
+  events.
+</Warning>
+
+## Gotchas
+
+<Warning>
+  **`POSTHOG_TENANT` must equal the tag in code.** The meters filter on the
+  value in the env var; events carry the value in `posthog.register`. If they
+  differ, the meter reads zero. Two live examples: **expeed** is tagged
+  `"expeeed"` in both code and env (consistent, so leave it — renaming splits
+  history), and **homeandgarden** is tagged `"valley"`, not `homeandgarden`.
+</Warning>
+
+<Warning>
+  **`POSTHOG_AI_KEY_NAME` must match the model-gateway key name in PostHog.**
+  A wrong name makes the Intelligence meter show another client's AI spend. If
+  it is unset the meter refuses to answer.
+</Warning>
+
+- A missing `NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN` does not error — `posthog.init`
+  runs with `undefined` and silently sends nothing.
+- `.env.local` is gitignored and `.vercel` is gitignored. Check with
+  `git check-ignore` before adding either to a new repo.
+- Code changes (new `instrumentation.ts`, new dependency) only take effect once
+  committed and deployed. Setting env vars alone does not enable server-side
+  error tracking.
+
+## Audit checklist
+
+Run from the folder that holds all client repos. Everything below reads **names
+only** — never print values.
+
+<Steps>
+  <Step title="Dependencies and code">
+    ```bash
+    grep -ho '"posthog[^"]*": *"[^"]*"' <app>/package.json
+    grep -rIl -i posthog <app> --include='*.ts' --include='*.tsx' \
+      --exclude-dir=node_modules --exclude-dir=.next
+    ls <app>/instrumentation.ts <app>/instrumentation-client.ts <app>/lib/posthog-server.ts
+    ```
+  </Step>
+  <Step title="Local env (names only)">
+    ```bash
+    grep -hoE '^[A-Z_]*POSTHOG[A-Z_]*' <app>/.env*
+    ```
+  </Step>
+  <Step title="Production env on Vercel (names only)">
+    ```bash
+    vercel api "/v10/projects/<app>/env?teamId=<team-id>" \
+      | python3 -I -c 'import sys,json; d=json.loads(sys.stdin.read()); \
+        [print(e["key"], e["target"]) for e in d["envs"] if "POSTHOG" in e["key"]]'
+    ```
+    All seven names must appear with target `production`.
+  </Step>
+  <Step title="Tenant tag agrees">
+    Compare `posthog.register({ tenant })`, the `captureException` tenant, and
+    `POSTHOG_TENANT` in env. All three must match.
+  </Step>
+  <Step title="Events actually arrive">
+    In PostHog, filter the shared project by the `tenant` property and confirm
+    recent `$pageview` and `$exception` events after a redeploy.
+  </Step>
+</Steps>
+
+## Rollout status — 2026-10-07
+
+Audit of the ten active clients and what was changed. "Prod" means Vercel
+production env.
+
+| Client | State after the audit |
+| --- | --- |
+| carmate, expeed, picotin, sujaskitchen, tflc | already complete — no change |
+| cfs | browser token and host added to prod; `posthog-node`, `instrumentation.ts`, `lib/posthog-server.ts` added **locally, uncommitted** |
+| fluitron | all seven variables added to `.env.local` and prod |
+| homeandgarden | all seven variables added to `.env.local` and prod (tenant `valley`) |
+| lec | the five server variables added to `.env.local` and prod |
+| dmn | `posthog-node` and server instrumentation added **locally, uncommitted**; no billing query variables, since it is a flat Workflow plan with no usage meters |
+
+### Open items
+
+- **cfs and dmn code is not committed or deployed.** Until it ships, they have
+  no server-side error tracking.
+- **cfs, fluitron, homeandgarden, lec need a redeploy** for the new
+  `NEXT_PUBLIC_*` values to reach the browser.
+- **`POSTHOG_AI_KEY_NAME` for fluitron and homeandgarden is unverified.** They
+  were set to `Fluitron` and `Home And Garden` by naming convention and have
+  not been checked against the gateway key names in PostHog.
+- **Event flow was not confirmed.** The audit covered code and env only; no
+  PostHog query was run.

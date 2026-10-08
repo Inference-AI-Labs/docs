@@ -21,6 +21,7 @@
         "group": "Conventions",
         "pages": [
           "conventions/posthog",
+          "conventions/posthog-setup",
           "conventions/workflow-codes",
           "conventions/billing-meters",
           "conventions/marketing-prospects",
