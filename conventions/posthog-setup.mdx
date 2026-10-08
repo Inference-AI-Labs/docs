@@ -95,20 +95,49 @@ log a value while doing this.
   events.
 </Warning>
 
+## Authorized URLs
+
+The PostHog toolbar and heatmaps only work on origins listed under the shared
+project's **Authorized URLs** (`app_urls` in project settings). Every client
+host must be on the list, so adding it is part of onboarding a new client.
+
+- Use the real host the app sends events from, not the tenant name. Read it
+  from the events: `SELECT properties.tenant, properties.$host, count() FROM
+  events GROUP BY 1, 2`. For example `sujas.takeflow.io` and
+  `expeed.takeflow.io` are the hosts of the `sujas` and `expeed` tenants.
+- Updating the setting **replaces the whole list**. Read the current
+  `app_urls` first and send back every existing entry plus the new one.
+- Ignore local hosts such as `127.0.0.1:3003`.
+
+All ten clients are listed as of 2026-10-08: carmate, tflc, cfs, dmn, expeed,
+fluitron, homeandgarden, lec, picotin and sujas, each at `https://<host>.takeflow.io`.
+
 ## Gotchas
 
 <Warning>
   **`POSTHOG_TENANT` must equal the tag in code.** The meters filter on the
-  value in the env var; events carry the value in `posthog.register`. If they
-  differ, the meter reads zero. Two live examples: **expeed** is tagged
-  `"expeeed"` in both code and env (consistent, so leave it — renaming splits
-  history), and **homeandgarden** is tagged `"valley"`, not `homeandgarden`.
+  value in the env var; events carry the value in `posthog.register` and in
+  `captureException`. If they differ, the meter reads zero. Change all three
+  together and redeploy.
 </Warning>
 
 <Warning>
-  **`POSTHOG_AI_KEY_NAME` must match the model-gateway key name in PostHog.**
-  A wrong name makes the Intelligence meter show another client's AI spend. If
-  it is unset the meter refuses to answer.
+  **Renaming a tenant tag splits history.** On 2026-10-08 expeed moved from
+  `"expeeed"` to `"expeed"` and homeandgarden from `"valley"` to
+  `"homeandgarden"`. Events already ingested keep their old tag, so any saved
+  filter, dashboard or alert must match **both** names. Rename only the event
+  `tenant` property. Leave the person distinct-id prefix (`expeeed:<user id>`,
+  `valley:<uuid>`) alone — changing it orphans existing person profiles — and
+  leave entity keys, storage keys and domains alone too.
+</Warning>
+
+<Warning>
+  **`POSTHOG_AI_KEY_NAME` must match the model-gateway key name exactly, and the
+  match is case-sensitive.** The Intelligence meter filters
+  `$ai_generation` events on `properties.openrouter_api_key_name = <name>`. A
+  wrong name reads zero or, worse, another client's spend. If it is unset the
+  meter refuses to answer. Two real misses: `Home and Garden` (lowercase
+  "and"), not `Home And Garden`, and `Carmatev1`, not `Carmate`.
 </Warning>
 
 - A missing `NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN` does not error — `posthog.init`
@@ -151,33 +180,58 @@ only** — never print values.
     `POSTHOG_TENANT` in env. All three must match.
   </Step>
   <Step title="Events actually arrive">
-    In PostHog, filter the shared project by the `tenant` property and confirm
-    recent `$pageview` and `$exception` events after a redeploy.
+    After a redeploy, every tenant should show recent events:
+
+    ```sql
+    SELECT properties.tenant AS tenant,
+           countIf(event = '$pageview') AS pageviews,
+           countIf(event = '$exception') AS exceptions,
+           max(timestamp) AS last_event
+    FROM events
+    WHERE timestamp > now() - INTERVAL 24 HOUR
+    GROUP BY tenant
+    ```
+
+    A tenant missing from the result, or with a stale `last_event`, is not
+    sending. Check its `NEXT_PUBLIC_*` variables and that it was redeployed.
+  </Step>
+  <Step title="AI key name matches the gateway">
+    ```sql
+    SELECT properties.openrouter_api_key_name AS key_name, count() AS calls
+    FROM events
+    WHERE event = '$ai_generation'
+    GROUP BY key_name
+    ```
+
+    Each client's `POSTHOG_AI_KEY_NAME` must appear here character for
+    character. A client with no row has no gateway key yet.
+  </Step>
+  <Step title="Host is authorized">
+    Confirm the client's host is in the project's
+    [Authorized URLs](#authorized-urls).
   </Step>
 </Steps>
 
-## Rollout status — 2026-10-07
+## Rollout status — 2026-10-08
 
-Audit of the ten active clients and what was changed. "Prod" means Vercel
-production env.
+All ten active clients are ingesting into the shared project: every tenant has
+`$pageview` events in the last 24 hours. "Prod" means Vercel production env.
 
-| Client | State after the audit |
+| Client | State |
 | --- | --- |
-| carmate, expeed, picotin, sujaskitchen, tflc | already complete — no change |
-| cfs | browser token and host added to prod; `posthog-node`, `instrumentation.ts`, `lib/posthog-server.ts` added **locally, uncommitted** |
-| fluitron | all seven variables added to `.env.local` and prod |
-| homeandgarden | all seven variables added to `.env.local` and prod (tenant `valley`) |
-| lec | the five server variables added to `.env.local` and prod |
-| dmn | `posthog-node` and server instrumentation added **locally, uncommitted**; no billing query variables, since it is a flat Workflow plan with no usage meters |
+| carmate, picotin, sujaskitchen, tflc | complete; carmate's AI key name corrected to `Carmatev1` |
+| expeed | complete; events now tagged `expeed` (was `expeeed`) |
+| homeandgarden | complete; events now tagged `homeandgarden` (was `valley`); AI key name corrected to `Home and Garden` |
+| cfs | browser token added to prod and redeployed; server-side error tracking committed and deployed |
+| fluitron | all seven variables in `.env.local` and prod; redeployed |
+| lec | five server variables added to prod; redeployed |
+| dmn | server-side error tracking committed and deployed; only the two browser variables in prod, deliberately — it is a flat Workflow plan with no usage meters |
+
+The Authorized URLs list holds all ten client hosts.
 
 ### Open items
 
-- **cfs and dmn code is not committed or deployed.** Until it ships, they have
-  no server-side error tracking.
-- **cfs, fluitron, homeandgarden, lec need a redeploy** for the new
-  `NEXT_PUBLIC_*` values to reach the browser.
-- **`POSTHOG_AI_KEY_NAME` for fluitron and homeandgarden is unverified.** They
-  were set to `Fluitron` and `Home And Garden` by naming convention and have
-  not been checked against the gateway key names in PostHog.
-- **Event flow was not confirmed.** The audit covered code and env only; no
-  PostHog query was run.
+- **fluitron's `POSTHOG_AI_KEY_NAME` can't be verified yet.** It is set to
+  `Fluitron`, but no gateway key with that name exists, so there are no
+  `$ai_generation` events to match. Create the key with that exact name when
+  fluitron starts using AI, then re-run the AI key check.
