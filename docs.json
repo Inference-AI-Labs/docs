@@ -22,6 +22,7 @@
         "pages": [
           "conventions/posthog",
           "conventions/posthog-setup",
+          "conventions/llm-tracing",
           "conventions/workflow-codes",
           "conventions/billing-meters",
           "conventions/marketing-prospects",

@@ -1,0 +1,171 @@
+---
+title: LLM tracing — OpenRouter Broadcast
+sidebarTitle: LLM tracing
+description: How Flow apps tag every OpenRouter call with a trace so model calls can be observed and evaluated per tenant, feature, prompt version and deploy.
+---
+
+Every model call in a Flow app goes through OpenRouter's `chat/completions`
+endpoint. OpenRouter **Broadcast** forwards a trace of each request to the
+observability tools configured on the account (PostHog, Langfuse, Braintrust,
+Datadog, S3, an OpenTelemetry collector, …) without any tracing SDK in the app.
+
+The app's only job is to label each request well enough that a trace can be
+filtered, grouped and scored in an eval. That label is the request's `trace`
+field, built by one helper per app: `lib/openrouter-trace.ts`. The reference
+implementation is **sujas** (Suja's Kitchen).
+
+<Note>
+  The `trace` field does nothing until a destination is added under
+  **OpenRouter → Settings → Observability**. With Broadcast off, OpenRouter
+  ignores it, so the helper is safe to ship before any destination exists.
+</Note>
+
+## The helper
+
+Spread its result into the request body. It returns `trace`, plus the top-level
+`session_id` and `user` fields when they're given.
+
+```ts lib/openrouter-trace.ts
+openrouterTrace({
+  feature,     // Flow area: "assistant", "kitchen-portions", "purchase-invoices"
+  step,        // this model call within the feature: "round 2", "read report"
+  traceId,     // optional: groups several calls into one trace
+  sessionId,   // optional: groups traces across turns (a chat thread)
+  user,        // optional: Supabase user id, when a person triggered the call
+  prompt,      // optional: instruction text; only its hash is sent
+  meta,        // eval context: flat scalars only
+})
+// → { trace: {...}, session_id?, user? }
+```
+
+```ts app/api/kitchen/portions/route.ts
+body: JSON.stringify({
+  model: MODEL,
+  ...openrouterTrace({
+    feature: "kitchen-portions",
+    step: "production sheet",
+    traceId: proposalId || null,
+    user: user.id,
+    prompt: SYSTEM,
+    meta: { proposalId, pax, mealType, dishes: dishes.length, history: historyBlock.length > 0, model: MODEL, temperature: 0.3 },
+  }),
+  messages,
+})
+```
+
+## What every trace carries
+
+| Key | Source | Why |
+| --- | --- | --- |
+| `trace_name` | `sujas/<feature>` | Names the root trace in the destination |
+| `span_name` / `generation_name` | `feature` / `step` | Gives the trace → span → generation nesting |
+| `feature`, `step` | same values as plain keys | So they can be filtered like any other field |
+| `trace_id` | `traceId`, when given | Groups calls. See [trace ids](#choosing-a-trace-id) |
+| `prompt_version` | first 10 hex chars of `sha256(prompt)` | Lets evals compare results before and after a prompt edit |
+| `app` | constant per app (`sujaskitchen`) | Tenant tag: one OpenRouter account serves many apps |
+| `env` | `VERCEL_ENV` | Separates production from preview and local traces |
+| `commit` | `VERCEL_GIT_COMMIT_SHA` (7 chars) | Ties a regression to the release that caused it |
+| `deployment` | `VERCEL_DEPLOYMENT_ID` | Exact deploy the call ran on |
+| everything in `meta` | call site | The inputs that shape output quality |
+
+Top-level, outside `trace`: `session_id` (≤ 256 chars) and `user` (≤ 128
+chars). Destinations sample by `session_id`, so a sampled conversation is kept
+whole.
+
+## Choosing a trace id
+
+Use the app's **own record id** wherever one exists. The trace then joins
+straight to the ground truth an eval scores against, with no new column.
+
+| Feature | `trace_id` | Joins to |
+| --- | --- | --- |
+| `kitchen-portions` | proposal id | `kitchen_portion_evals.proposal_id` (and every regeneration of that proposal lands in the same trace) |
+| `assistant` | a UUID per question; `session_id` = thread id | each tool round is one generation; the thread is `assistant_threads.id` |
+
+Calls with no natural record id leave `trace_id` unset. Each becomes its own
+single-generation trace.
+
+## What goes in `meta`
+
+`meta` is the eval context: the inputs that explain a good or bad output.
+Record **counts, flags, ids and sampling settings**, never the content itself.
+The prompt and completion already travel with the trace.
+
+- Always `model` and `temperature`, so runs on different settings can be compared.
+- Retrieval or context signals: `history: true/false`, `pool_size`, `items_with_results`.
+- Difficulty signals: `dishes`, `candidates`, `avoid` (earlier options to steer away from).
+- Retry signals: `attempt`. Attempt 2 or more means attempt 1 failed.
+- Join keys: `proposalId`, `clientId`, `fileName`.
+
+Keep values flat (`string | number | boolean`). Nested objects don't filter
+consistently across destinations. `null` and `undefined` are dropped.
+
+<Warning>
+  Only pass `prompt` when it is **static** instruction text. A prompt that
+  embeds the user's message, caption or file contents hashes differently on
+  every call and makes `prompt_version` meaningless. For those calls (sujas:
+  food-safety, maintenance, inventory), leave `prompt` out and use `commit`
+  to identify the prompt revision.
+</Warning>
+
+## Attribution headers
+
+Every call also sends OpenRouter's app-attribution headers. Use the app's
+**real production domain**, not a placeholder:
+
+```ts
+headers: {
+  Authorization: `Bearer ${key}`,
+  "Content-Type": "application/json",
+  "HTTP-Referer": "https://sujas.takeflow.io",
+  "X-Title": "Sujas Kitchen - Purchase",
+}
+```
+
+`X-Title` is `"<Client> - <Feature>"`. It's how requests are grouped in
+OpenRouter's own activity view.
+
+## Privacy
+
+Some features send staff photos and WhatsApp messages to the model (sujas:
+food-safety, maintenance, inventory, purchase invoices). For a destination that
+shouldn't store that content, turn on **Privacy Mode** for that destination in
+OpenRouter. Prompts and completions are stripped; token counts, cost, timing,
+model and every `trace` key above still arrive. It is set per destination, so
+one tool can get full traces while another gets redacted ones.
+
+## Scoring traces
+
+A trace holds only what was known **when the request was sent**. The outcome
+an eval scores comes later, for example the kitchen editing a portion sheet,
+an invoice failing its self-checks, or a team member rating a Teach AI round.
+To put that outcome next to the trace, the app sends a score to the eval tool
+keyed by the same `trace_id`. This is why the trace id should be a record id.
+
+<Note>
+  Score write-back is not built yet. Portions and Teach AI are the first
+  candidates, since their ground truth is already stored in the database.
+</Note>
+
+## Adding tracing to a new call
+
+<Steps>
+  <Step title="Pick feature and step">
+    `feature` is the Flow area (kebab-case). `step` names this call within it.
+  </Step>
+  <Step title="Pick a trace id">
+    Use the record id the output will be judged against, if there is one.
+  </Step>
+  <Step title="Pass the static prompt">
+    Pass the system or instruction constant, if the call has one.
+  </Step>
+  <Step title="Fill meta">
+    Add `model`, `temperature`, and the counts and flags that drive quality.
+  </Step>
+  <Step title="Set the headers">
+    `HTTP-Referer` (real domain) and `X-Title`.
+  </Step>
+</Steps>
+
+Related: [PostHog usage](/conventions/posthog), which is also one of the
+supported Broadcast destinations.
